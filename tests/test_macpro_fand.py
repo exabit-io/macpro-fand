@@ -68,7 +68,18 @@ class Box:
                     return
 
 
+def test_default_ceiling(m):
+    """The default GPU ceiling is 125 W: no reallocation raises a die above it, however idle the CPU."""
+    m._BASE = m.BASE
+    b = m.Budget({a: "/nonexistent" for a in DIES}, True)
+    for t in range(4, 200, 4):
+        b.rebalance(float(t), {a: 0.97 * b.gpu[a] for a in DIES}, 20.0)
+    check(m.GPU_CAP["max"] == 125 and max(b.gpu.values()) <= 125.0 + 1e-6,
+          f"default ceiling 125 W holds, CPU idle, dies saturated ({[round(v) for v in b.gpu.values()]})")
+
+
 def test_budget(m):
+    m.GPU_CAP["max"] = 200                          # the mechanism tests run with Vega 20's full range
     for extra in (0.0, 118.0):
         box = Box(m, m.BASE + extra)
         b = box.b
@@ -166,6 +177,7 @@ def main():
     m = load()
     test_level(m)
     test_cpu_target(m)
+    test_default_ceiling(load())
     test_budget(m)
     test_rapl_regulated_cpu(load())
     test_pins_backstop(load())

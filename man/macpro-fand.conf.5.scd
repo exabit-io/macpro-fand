@@ -89,8 +89,13 @@ the middle front fan (MPX bay 2 and PCIe slots 5-8), *4* the top front fan
 	Worst case added to BASE for each Mellanox card, NVMe drive (other than
 	the internal flash) and rotational disk found at start.
 
-*GPU_CAP* = _{"floor": 85, "max": 200, "init": 125}_
-	Range of a GPU die's cap and its default share, W.
+*GPU_CAP* = _{"floor": 85, "max": 125, "init": 125}_
+	Range of a GPU die's cap and its default share, W. 125 W is the
+	efficient point for LLM serving: decode is bound by HBM bandwidth,
+	which does not depend on the cap, so above about 100-110 W each
+	percent of extra node power buys less than a percent of work. Raise
+	*max* (Vega 20 accepts up to 200) for compute-bound work, e.g.
+	*GPU_CAP = {"max": 175}*.
 
 *CPU_PL1* = _{"floor": 80, "max": 413}_
 	Range of the CPU's PL1, W.

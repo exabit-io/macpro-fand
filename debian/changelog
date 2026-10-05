@@ -1,3 +1,12 @@
+macpro-fand (1.0.1) unstable; urgency=medium
+
+  * GPU die caps at most 125 W by default (GPU_CAP max 200 -> 125): the
+    efficient point for LLM serving, 16 % more tokens per kJ of node energy
+    than 200 W. Raise it in /etc/macpro-fand.conf for compute-bound work.
+  * Documentation: the apt channel "macpro-fand" carries every release.
+
+ -- Exabit Networks <packages@exabit.io>  Mon, 05 Oct 2026 20:42:57 -0000
+
 macpro-fand (1.0.0) unstable; urgency=medium
 
   * Initial release: four zone fan governors with hysteresis, full-speed

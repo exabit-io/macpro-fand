@@ -42,6 +42,9 @@ equilibrium:
   - Uncapped devices found at start (Mellanox cards, extra NVMe drives, disks) add their worst case to the base.
   - A measured-DC backstop drops every limit to its floor.
 - **Full auto:** each GPU die's cap also follows its temperature, held at a working temperature that limits leakage.
+- **125 W per die by default:** the efficient point for LLM serving. Decode is bound by HBM bandwidth, which does not
+  depend on the cap. Against 200 W it gives 16 % more tokens per kJ of node energy for 14 % fewer tokens/s per node.
+  Raise the ceiling in `/etc/macpro-fand.conf` for compute-bound work.
 - **Clean stop:** every fan goes to full speed and then to `t2fanrd`. On a failure, every fan stays at full speed and
   the power limits go to a statically safe allocation.
 
@@ -55,7 +58,7 @@ From the Exabit apt repository (Ubuntu 24.04):
 sudo install -d -m 755 /etc/apt/keyrings
 curl -fsSL https://exabit-io.github.io/resize-amdgpu-bars/keys/resize-amdgpu-bars.gpg \
     | sudo tee /etc/apt/keyrings/resize-amdgpu-bars.gpg > /dev/null
-echo 'deb [signed-by=/etc/apt/keyrings/resize-amdgpu-bars.gpg] https://github.com/exabit-io/resize-amdgpu-bars/releases/download/macpro-fand-1.0.0 ./' \
+echo 'deb [signed-by=/etc/apt/keyrings/resize-amdgpu-bars.gpg] https://github.com/exabit-io/resize-amdgpu-bars/releases/download/macpro-fand ./' \
     | sudo tee /etc/apt/sources.list.d/macpro-fand.list
 sudo apt update
 sudo apt install macpro-fand

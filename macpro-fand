@@ -59,7 +59,7 @@ import sys
 import threading
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 CONFIG = "/etc/macpro-fand.conf"
 EX_NOHW = 78           # no Mac Pro 7,1 fan hardware: systemd does not restart (RestartPreventExitStatus=78)
 
@@ -123,7 +123,10 @@ BUDGET_MARGIN = 80.0       # kept free: model error, AC-side events (a clamp onc
 # 1.156 * package, rms 3.9 W, max 8 W (GPUs 85-200 W, CPU 100-268 W, combined up to 975 W predicted / 975 W measured).
 # BASE adds 60 W for memory/flash traffic the model does not see (DIMM saturation + flash reads measured +45 W).
 BASE, K_GPU, K_CPU = 127.0, 1.205, 1.156
-GPU_CAP = {"floor": 85, "max": 200, "init": 125}       # W per die; caps <= 85 W all land on the 999 MHz floor
+# max 125 W: the efficient point for LLM serving (decode is HBM-bandwidth-bound: tokens per node-kJ +16 % against
+# 200 W for -14 % tokens/s per node; above ~100-110 W each % of extra node power buys < 1 % of work). Raise it in
+# /etc/macpro-fand.conf for compute-bound work.
+GPU_CAP = {"floor": 85, "max": 125, "init": 125}       # W per die; caps <= 85 W all land on the 999 MHz floor
 # Full auto: a die's cap follows its temperature, not a fixed number. The fans hold the bays at 100 F
 # while they can; once a die passes its working temperature (far above 100 F: its bay fan is at full speed by then) its
 # ceiling comes down until it holds there, and goes back up slowly once it is cooler. Hot dies leak, and LLM decode is
@@ -582,7 +585,7 @@ class Budget:
         self.gpu = {a: float(GPU_CAP["init"]) for a in cap_paths}
         self.pl1 = float(CPU_PL1["max"])                      # fit() brings it down to what the invariant allows
         self.pin = None                                       # W per die while an override pins the GPU caps
-        self.tcap = {a: GPU_CAP["init"] + CAP_LEAD for a in cap_paths}   # working-temperature ceilings (thermal())
+        self.tcap = {a: min(float(GPU_CAP["max"]), GPU_CAP["init"] + CAP_LEAD) for a in cap_paths}   # see thermal()
         self.pl2 = os.access(RAPL_PL2, os.W_OK)              # held at PL1 where the firmware lets us write it
         self.written = {}
         self.over_n, self.floor_until, self.last, self.failed = 0, 0.0, 0.0, None
@@ -704,7 +707,8 @@ class Budget:
                 self.gpu, self.pl1 = g, max(CPU_PL1["floor"], self.room(g))
             return None
         lo = GPU_CAP["floor"]
-        g = {a: min(v, self.tcap[a]) for a, v in self.gpu.items()}   # a hot die's ceiling binds at once
+        top = {a: min(self.tcap[a], float(GPU_CAP["max"])) for a in self.gpu}   # thermal ceiling, never over the max
+        g = {a: min(v, top[a]) for a, v in self.gpu.items()}   # a hot die's ceiling binds at once
         pl1 = self.pl1
         free = lambda: self.limit - self.cost(g, pl1)
         idle = [a for a in g if die_w.get(a) is not None and die_w[a] <= IDLE * g[a] and g[a] > lo]
@@ -717,11 +721,11 @@ class Budget:
             level(g, list(g), need, {a: lo for a in g}, True)             # then every die evenly
             pl1 = min(target, pl1 + max(0.0, free()) / K_CPU)
         else:
-            want = [a for a in g if die_w.get(a) is not None and die_w[a] >= SAT * g[a] and g[a] < self.tcap[a] - 0.5]
+            want = [a for a in g if die_w.get(a) is not None and die_w[a] >= SAT * g[a] and g[a] < top[a] - 0.5]
             for a in idle if want else []:
                 g[a] = max(lo, die_w[a] * 1.3, g[a] - max(5.0, STEP_FRAC * g[a]))
             keep = pl1 if cpu_w is None else max(CPU_PL1["floor"], cpu_w * CPU_KEEP[0] + CPU_KEEP[1])
-            ceil = {a: min(self.tcap[a], g[a] + max(5.0, STEP_FRAC * g[a])) for a in want}   # (empty: no-op)
+            ceil = {a: min(top[a], g[a] + max(5.0, STEP_FRAC * g[a])) for a in want}   # (empty: no-op)
             need = K_GPU * sum(ceil[a] - g[a] for a in want)
             short = need - max(0.0, free())
             if short > 0 and pl1 > keep:                       # the CPU lends only what it does not use
