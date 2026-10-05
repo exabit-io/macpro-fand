@@ -552,7 +552,8 @@ def write_static_safe():
     ss = static_safe()
     caps = sorted(glob.glob("/sys/bus/pci/devices/*/hwmon/hwmon*/power1_cap"))
     caps = [c for c in caps if any(a in c for a in die_map())]
-    order = [(RAPL_PL1, ss["pl1"]), (RAPL_PL2, ss["pl1"])] + [(c, ss["gpu"]) for c in caps]
+    order = [(RAPL_PL1, ss["pl1"])] + ([(RAPL_PL2, ss["pl1"])] if os.access(RAPL_PL2, os.W_OK) else []) + \
+        [(c, ss["gpu"]) for c in caps]
     order.sort(key=lambda x: -((rd(x[0], 1e6) or 0) - x[1]))          # lowering writes (biggest decrease) first
     for path, w in order:
         ok = write_async(path, int(w * 1e6))
@@ -570,6 +571,7 @@ class Budget:
         self.pl1 = float(CPU_PL1["max"])                      # fit() brings it down to what the invariant allows
         self.pin = None                                       # W per die while an override pins the GPU caps
         self.tcap = {a: GPU_CAP["init"] + CAP_LEAD for a in cap_paths}   # working-temperature ceilings (thermal())
+        self.pl2 = os.access(RAPL_PL2, os.W_OK)              # held at PL1 where the firmware lets us write it
         self.written = {}
         self.over_n, self.floor_until, self.last, self.failed = 0, 0.0, 0.0, None
         self.dc = None
@@ -605,21 +607,33 @@ class Budget:
         if self.dry:
             return True
         want = {p: int(self.gpu[a] * 1e6) for a, p in self.paths.items()}
-        want[RAPL_PL1] = want[RAPL_PL2] = int(self.pl1 * 1e6)
+        want[RAPL_PL1] = int(self.pl1 * 1e6)
+        if self.pl2:
+            want[RAPL_PL2] = want[RAPL_PL1]
         cur = {p: rd(p) for p in want}
         down = [p for p in want if cur[p] is None or want[p] < cur[p] - 1e5]
         up = [p for p in want if p not in down and abs(want[p] - (cur[p] or 0)) > 1e5]
         up.sort(key=lambda p: p != RAPL_PL2)                  # PL2 never below PL1 on the way up
         for p in down:
             if not write_async(p, want[p]):
+                if p == RAPL_PL2:                            # firmware-locked PL2: PL1 alone, as before
+                    self.pl2 = False
+                    self.written.pop(p, None)
+                    log(budget_note="PL2 not writable: no longer held at PL1")
+                    continue
                 self.failed = p
                 return False
             self.written[p] = want[p]
         for p in up:
             if write_async(p, want[p]):
                 self.written[p] = want[p]
+            elif p == RAPL_PL2:
+                self.pl2 = False
+                self.written.pop(p, None)
+                log(budget_note="PL2 not writable: no longer held at PL1")
         for p in want:
-            self.written.setdefault(p, want[p])
+            if p != RAPL_PL2 or self.pl2:
+                self.written.setdefault(p, want[p])
         self.failed = None
         return True
 
