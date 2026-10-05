@@ -2,11 +2,10 @@
 
 ## 1.0.1
 
-- GPU die caps at most 125 W by default (was 200 W), the efficient point for LLM serving. Decode is bound by HBM
-  bandwidth, so against 200 W per die it gives 16 % more tokens per kJ of node energy for 14 % fewer tokens/s per
-  node. Above about 100-110 W per die each percent of extra node power buys less than a percent of work. Raise
-  `GPU_CAP` "max" in `/etc/macpro-fand.conf` (up to 200) for compute-bound work.
-- Installs from the rolling apt channel `macpro-fand`, which carries every release.
+- The installed `/etc/macpro-fand.conf` sets `GPU_CAP = {"max": 125}`: GPU dies at most 125 W by default. The built-in
+  range is unchanged (85-200 W); comment the line out for the full range.
+- The budget's reallocation clamps every die to the configured `GPU_CAP` maximum itself (a ceiling below the default
+  share + 10 W could be exceeded until the working-temperature ceilings caught up).
 
 ## 1.0.0
 

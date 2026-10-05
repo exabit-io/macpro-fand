@@ -1,9 +1,11 @@
 macpro-fand (1.0.1) unstable; urgency=medium
 
-  * GPU die caps at most 125 W by default (GPU_CAP max 200 -> 125): the
-    efficient point for LLM serving, 16 % more tokens per kJ of node energy
-    than 200 W. Raise it in /etc/macpro-fand.conf for compute-bound work.
-  * Documentation: the apt channel "macpro-fand" carries every release.
+  * The installed /etc/macpro-fand.conf sets GPU_CAP = {"max": 125}: GPU
+    dies at most 125 W by default. The built-in range is unchanged
+    (85-200 W); comment the line out for the full range.
+  * The budget's reallocation clamps every die to the configured GPU_CAP
+    maximum itself (a ceiling below the default share + 10 W could be
+    exceeded until the working-temperature ceilings caught up).
 
  -- Exabit Networks <packages@exabit.io>  Mon, 05 Oct 2026 20:42:57 -0000
 

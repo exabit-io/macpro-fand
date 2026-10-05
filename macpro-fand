@@ -123,10 +123,10 @@ BUDGET_MARGIN = 80.0       # kept free: model error, AC-side events (a clamp onc
 # 1.156 * package, rms 3.9 W, max 8 W (GPUs 85-200 W, CPU 100-268 W, combined up to 975 W predicted / 975 W measured).
 # BASE adds 60 W for memory/flash traffic the model does not see (DIMM saturation + flash reads measured +45 W).
 BASE, K_GPU, K_CPU = 127.0, 1.205, 1.156
-# max 125 W: the efficient point for LLM serving (decode is HBM-bandwidth-bound: tokens per node-kJ +16 % against
-# 200 W for -14 % tokens/s per node; above ~100-110 W each % of extra node power buys < 1 % of work). Raise it in
-# /etc/macpro-fand.conf for compute-bound work.
-GPU_CAP = {"floor": 85, "max": 125, "init": 125}       # W per die; caps <= 85 W all land on the 999 MHz floor
+# max = Vega 20's own 200 W. The efficient cap depends on the workload (memory-bound LLM decode gains little above
+# ~110 W; compute-bound FP32/FP64 keeps gaining to 175 W and beyond), so a lower ceiling is a per-node policy in
+# /etc/macpro-fand.conf, not a default.
+GPU_CAP = {"floor": 85, "max": 200, "init": 125}       # W per die; caps <= 85 W all land on the 999 MHz floor
 # Full auto: a die's cap follows its temperature, not a fixed number. The fans hold the bays at 100 F
 # while they can; once a die passes its working temperature (far above 100 F: its bay fan is at full speed by then) its
 # ceiling comes down until it holds there, and goes back up slowly once it is cooler. Hot dies leak, and LLM decode is

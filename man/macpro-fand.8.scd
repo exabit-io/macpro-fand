@@ -103,8 +103,9 @@ dies, and only the part of the CPU's limit that the CPU does not use (it keeps
 1.2 × its draw + 20 W). Whatever the dies do not hold goes back to the CPU.
 Limits are always lowered before any limit is raised, so the invariant holds
 at every step. A die cap never goes below 85 W (Vega 20 ignores lower caps)
-and PL1 never below 80 W. A die cap never goes above 125 W by default, the
-efficient point for LLM serving (see *GPU_CAP* in *macpro-fand.conf*(5)).
+and PL1 never below 80 W. A die cap never goes above the configured maximum
+(*GPU_CAP*: 125 W in the installed configuration file, Vega 20's 200 W
+without that line; see *macpro-fand.conf*(5)).
 
 As a backstop, a measured DC power over 1190 W on two samples in a row drops
 every limit to its floor for 60 s. When the daemon stops or fails, the limits
@@ -165,7 +166,7 @@ Any of these may be followed by:
 
 *gpu=*_W_
 	Pin every GPU die cap at _W_ watts, from 85 up to the configured
-	maximum (*GPU_CAP*, 125 W by default).
+	maximum (*GPU_CAP*: 125 W as installed, 200 W without that line).
 
 *pl1=*_W_
 	Pin the CPU's PL1 at _W_ watts (experiments may go below the floor).
