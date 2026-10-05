@@ -1,0 +1,10 @@
+__pycache__/
+man/*.8
+man/*.5
+debian/.debhelper/
+debian/macpro-fand/
+debian/files
+debian/*.substvars
+debian/*.debhelper
+debian/*.debhelper.log
+debian/debhelper-build-stamp

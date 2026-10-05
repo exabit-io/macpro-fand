@@ -1,0 +1,9 @@
+macpro-fand (1.0.0) unstable; urgency=medium
+
+  * Initial release: four zone fan governors with hysteresis, full-speed
+    alarms, the 1228 W power budget (CPU first, PL2 held at PL1, uncapped
+    devices added to the base load), per-die GPU working-temperature
+    ceilings, a load-dependent CPU target, /etc/macpro-fand.conf, and the
+    override file for benchmarks.
+
+ -- Exabit Networks <packages@exabit.io>  Mon, 05 Oct 2026 11:59:18 +0000

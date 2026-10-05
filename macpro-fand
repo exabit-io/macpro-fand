@@ -1,0 +1,1131 @@
+#!/usr/bin/env python3
+"""macpro-fand: zone fan control and power budget for a Mac Pro 7,1 (2019) on Linux (T2 applesmc).
+
+Four zones, one fan and one governor each (zone map measured one fan at a time):
+  bottom front fan  MPX bay 1 + PCH                    middle front fan  MPX bay 2, PCIe slots 5-8
+  top front fan     CPU                                blower            DIMMs, internal flash, power supply
+Each governor holds its zone at fixed thermal targets with hysteresis: over target + BAND it pushes its fan up,
+proportionally to the excess; inside the band it holds; under target - BAND it ramps down slowly. The MPX bays are
+held at 100 F (37.8 C, bay mean GPU junction) at whatever fan speed that takes. Any alarm sends every fan to its cap,
+and the governors then ramp down slowly from there.
+
+Alarms: a sensor near its critical limit, failed or stale sensor reads, a fan that does not follow its setting,
+another process writing the fans. The fans never go to the SMC's automatic mode: it has been seen holding every fan
+at its minimum and does not follow GPU heat. A clean stop hands the fans to t2fanrd (cap first); a failure leaves
+them at the cap.
+
+GPU sensors are read in a worker thread: a die whose SMU stops answering costs ~4 s per read, and an amdgpu read can
+block for good behind a stuck driver operation. The control loop only ever touches applesmc and coretemp; GPU data
+older than GPU_STALE raises an alarm.
+
+Power budget: the box must never draw more than the SMC's 1228 W DC envelope (crossing it latches the Vega 20 dies
+at 1000 MHz until a cold power cycle). Power caps are kept independent of temperature: whatever
+spikes at once, the sum of every consumer's worst case at its current limit stays under the budget,
+  BASE + K_GPU * sum(die caps) + K_CPU * PL1  <=  LIMIT - MARGIN,
+and the budget moves by demand, CPU first (everything in the box depends on the CPU). A CPU drawing >= 93 % of PL1 gets at least its default share at once, funded from free budget, idle dies,
+then every die evenly (a little off each of four); dies drawing >= 93 % of their cap get free budget, idle siblings'
+budget and only what the CPU does not use; whatever the dies do not hold is the CPU's. Within the budget each die's cap
+follows its temperature (full auto): over its working temperature T_WORK its ceiling comes down, below it the ceiling
+goes back up slowly. Lowering writes finish before any raising write. PL2 is held at PL1, so the CPU cannot burst
+past what the budget charges it for. BASE grows by a worst case for every uncapped device found at
+start beyond the calibrated box (NICs, NVMe drives, hard disks). Backstop: measured DC over BACKSTOP on two samples in
+a row -> every limit to its floor for 60 s. On stop or crash the limits go to STATIC_SAFE.
+
+Read-only towards amdgpu except the power caps. Run as root, normally as macpro-fand.service (Conflicts=t2fanrd).
+Settings: /etc/macpro-fand.conf (see macpro-fand.conf(5)); usage: macpro-fand(8).
+  macpro-fand             control loop
+  macpro-fand --dry-run   compute and log, write nothing
+  macpro-fand --release   hand the fans to t2fanrd (every fan to its cap first)
+  macpro-fand --stopped   systemd ExecStopPost: clean stop -> t2fanrd, failure -> full speed
+
+Override (benchmarks, experiments): one line in /run/macpro-fand/override, re-read every loop:
+  max                     every fan to its cap
+  hold F1 F2 F3 F4        exactly these rpm (an alarm still sends every fan to its cap)
+  gpu=W / pl1=W           pin the GPU caps / PL1 (inside the budget; working-temperature ceilings do not apply)
+  auto                    normal control (same as no file)
+  optional trailing ttl=SECONDS: ignored once the file is older than that
+"""
+import argparse
+import fcntl
+import glob
+import json
+import os
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = "1.0.0"
+CONFIG = "/etc/macpro-fand.conf"
+EX_NOHW = 78           # no Mac Pro 7,1 fan hardware: systemd does not restart (RestartPreventExitStatus=78)
+
+# ---------------------------------------------------------------- config
+PERIOD = 2.0                          # loop period, s
+
+# applesmc numbering: fan1 = SMC F0 = rear blower (memory side, 500-1200 rpm); fan2..fan4 = F1..F3 = front axials
+# (500-2500 rpm), bottom to top. Zone test, one fan raised at a time at thermal equilibrium, C per 100 rpm:
+#   fan2 bottom: MPX bay 1 dies -0.66/-0.72, PCH -0.44          fan3 middle: MPX bay 2 dies -0.33/-0.34
+#   fan4 top: CPU heatsink -0.12, package -0.14, DIMMs -0.10     blower: DIMMs -0.24, flash -0.20, PSU -0.6, CPU hs -0.19
+BLOWER, BOT, MID, TOP = 1, 2, 3, 4
+FRONT = (BOT, MID, TOP)
+MIN_RPM = {BLOWER: 500, BOT: 500, MID: 500, TOP: 500}
+CAP = {BLOWER: 1200, BOT: 2500, MID: 2500, TOP: 2500}
+
+# GPU dies by PCI address -> MPX bay.
+DIES = {}                              # {"0b:00.0": bay, ...}; empty = every AMD display device, bay by slot (MPX_BAY)
+MPX_BAY = {"1": 1, "2": 1, "3": 2, "4": 2}   # PCI slot -> MPX bay (bay 1 = lower module, slots 1-2; bay 2 = slots 3-4)
+BAY_FAN = {1: BOT, 2: MID}             # each front fan cools the lane behind it (cross terms 15-40 % of the own lane)
+
+# Zone governors. init = the measured idle setpoint (the start point; bays 1150 hold ~100 F in a ~16 C room);
+# floor = the lowest rpm the governor may choose. The MPX bays have no energy floor: 100 F decides. The CPU fan buys
+# nothing at idle (DC -0.53 W at 500 vs 1150, package +4 C, idle power unchanged); the blower is flat from 500 to 730
+# within 0.05 W and 600 keeps the power supply cooler (line search, one fan at a time, at thermal equilibrium). The
+# per-zone setting measured -0.5 W against all front fans at 1150 and the blower at 730.
+ZONES = {
+    BOT:    {"name": "MPX bay 1 + PCH", "floor": 500, "init": 1150},
+    MID:    {"name": "MPX bay 2", "floor": 500, "init": 1150},
+    TOP:    {"name": "CPU", "floor": 500, "init": 500},
+    BLOWER: {"name": "memory side", "floor": 600, "init": 600},
+}
+# Targets, C. The leakage zones hold their sensors at the idle temperatures of the energy-optimal setpoint (the lowest
+# reasonably achievable leakage), measured at thermal equilibrium; the MPX bays at 100 F.
+# BAND = default hysteresis half-width; the 1 C-step sensors (CPU package, PCH, flash) get 1.0 so quantisation cannot
+# make a governor hunt.
+BAY_TARGET = 37.8      # each bay's mean GPU junction (= 100 F; 37.9-38.1 bay 1, 36.0-37.0 bay 2 at 1150 rpm)
+HBM_TARGET = 80.0      # each bay's hottest HBM stack: a safety trigger, not an idle target
+# CPU target from two CPU fan sweeps under load, every point at equilibrium, down and back up (56 busy workers, clock
+# pinned), total DC against the top fan:
+#   133 W package (2.2 GHz): package power flat within 0.3 W from 37 to 67 C; DC vs
+#     1000 rpm: 500 +1.6, 750 -0.07, 1000 0, 1250 +0.18, 1500 +0.8, 2000 +2.1, 2500 +4.5 W -> optimum 750-1000 rpm,
+#     package 44-52 C (the gain there is board cooling around the CPU).
+#   228 W package (3.0 GHz): package power flat from 52 to 59 C, then +1.2 W at 64 C
+#     and +4.6 W at 78 C (leakage); DC vs 1500 rpm: 750 +7.2, 1000 +1.6, 1250 +0.1, 1500 0, 2000 +0.5, 2500 +2.5 W
+#     -> optimum 1250-1500 rpm, package 56-59 C.
+# The optimum temperature rises with load, so the target follows package power (RAPL, smoothed over CPU_TARGET_TAU):
+# 48 C at 133 W to 57.5 C at 228 W, interpolated, held flat outside. Idle (~28 C) stays on the 500 rpm floor.
+CPU_TARGET = ((133.0, 48.0), (228.0, 57.5))   # (package W, package C) points
+CPU_BAND = 1.0
+CPU_TARGET_TAU = 30.0      # s, package power smoothing for the target
+BAND = 0.5
+UP_GAIN, UP_MAX = 1.0, 150.0                    # rpm/s per C over the target; cap on the push, rpm/s
+DOWN_GAIN, DOWN_MIN, DOWN_MAX = 0.5, 0.25, 2.0  # rpm/s per C under the target, clipped: down is slow by design
+EMERG_MARGIN = 5.0     # a raw reading within this of crit sends every fan to its cap
+# Power budget. K_GPU / K_CPU / BASE: DC W per die W, per CPU package W, and the idle box with every fan at full
+# speed plus an allowance for memory/IO load -- from a calibration run on a Mac Pro 7,1 (W-3275M, 2x Vega II Duo).
+BUDGET_LIMIT = 1228.0      # SMC DC envelope, W
+BUDGET_MARGIN = 80.0       # kept free: model error, AC-side events (a clamp once followed an AC spike without a DC breach)
+# Calibration (fans at full speed, 14 steps, each at equilibrium): DC = 66.9 + 1.205 * dies +
+# 1.156 * package, rms 3.9 W, max 8 W (GPUs 85-200 W, CPU 100-268 W, combined up to 975 W predicted / 975 W measured).
+# BASE adds 60 W for memory/flash traffic the model does not see (DIMM saturation + flash reads measured +45 W).
+BASE, K_GPU, K_CPU = 127.0, 1.205, 1.156
+GPU_CAP = {"floor": 85, "max": 200, "init": 125}       # W per die; caps <= 85 W all land on the 999 MHz floor
+# Full auto: a die's cap follows its temperature, not a fixed number. The fans hold the bays at 100 F
+# while they can; once a die passes its working temperature (far above 100 F: its bay fan is at full speed by then) its
+# ceiling comes down until it holds there, and goes back up slowly once it is cooler. Hot dies leak, and LLM decode is
+# HBM-bandwidth-bound, so watts above the working temperature buy little. The budget allocates within these ceilings.
+# T_WORK is a stand-in (about what 125 W reaches at full airflow) until the GPU load sweep measures the leakage cost.
+T_WORK = (60.0, 1.0)       # die junction C, band
+HBM_WORK = 80.0            # hottest HBM stack, C (same band)
+CAP_DOWN = (1.0, 10.0)     # ceiling W/s per C over the band, max W/s (from the die's present draw: acts at once)
+CAP_UP = (0.1, 1.0)        # ceiling W/s per C under the band, max W/s
+CAP_EARLY = 5.0            # C over the band at which the ceiling comes down before the bay fan reaches full speed
+CAP_LEAD = 10.0            # a ceiling rises at most this far above the die's allocation (no windup)
+# CPU floor (56 busy workers, W-3275M): PL1 80 W still runs at a real clock (1.17 GHz, 76 W);
+# at 60 W the package drops under its 1.0 GHz minimum (775 MHz, duty cycling) and work per watt falls 2.42 -> 2.04 M/s/W
+# (best 2.77 at 120 W). Any PL1 <= 100 W costs ~3.5 W DC at idle (no further cost lower down), so the governor only
+# lowers PL1 when another consumer needs the budget.
+CPU_PL1 = {"floor": 80, "max": 413}                    # W
+STATIC_SAFE = {"gpu": 125, "pl1": None}                # stop/crash limits; pl1 None = the largest the invariant allows
+CPU_KEEP = (1.2, 20.0)     # a CPU under SAT keeps use * 1.2 + 20 W of PL1; the dies may borrow only above that
+# Uncapped devices the calibration did not see (e.g. M.2 NVMe carriers and Mellanox ConnectX-5 cards in slots 5-8, 3.5"
+# SATA disks in the AUX bay). Each one found at start adds its worst case to BASE;
+# datasheet figures until measured: a ConnectX-5 card up to 25 W, an NVMe drive 9 W at full write, a 3.5" disk 25 W
+# while spinning up. The Apple internal flash (vendor 0x106b) is part of the calibrated box.
+DEVICE_W = {"mellanox": 25.0, "nvme": 9.0, "disk": 25.0}
+BUDGET_PERIOD = 4.0        # s between reallocations
+SAT, IDLE = 0.93, 0.60     # a consumer drawing >= SAT of its limit wants more; <= IDLE of it can give
+STEP_FRAC = 0.20           # each move: at least this fraction of the current limit (GPU >= 5 W, CPU >= 10 W)
+BACKSTOP, BACKSTOP_N, BACKSTOP_HOLD = 1190.0, 2, 60.0  # measured DC W, consecutive samples, s at the floors
+RAPL_PL1 = "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"
+RAPL_PL2 = "/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw"   # short term (2 ms): held at PL1
+RAPL_E = "/sys/class/powercap/intel-rapl:0/energy_uj"
+TEST_BUDGET = float(os.environ.get("MACPRO_FAND_TEST_BUDGET", "0") or 0)     # test hook: budget (limit - margin)
+TEST_BACKSTOP = float(os.environ.get("MACPRO_FAND_TEST_BACKSTOP", "0") or 0)
+
+# SMC sensors by applesmc label -> (zone fan, target, emergency, band); emergencies are conservative guesses (an
+# emergency only means full speed). The PCH keeps its idle temperature (leakage silicon, bottom fan). The memory side
+# gets component-health targets instead of idle temperatures: the zone test measured no leakage payoff there (DIMM VR
+# power -0.025 W per 100 rpm of blower, which costs +0.39 W per 100 rpm), and idle targets measured at one room
+# temperature pinned the blower at its cap at idle once the room warmed (+1.7 C, ~2 W wasted).
+# Measured: DIMM proximity 25-28 C idle, 36-37 C under 16-way memory copies; power supply 31-37 C idle, 43 C with
+# four dies at 125 W; flash 22 C idle, 35-38 C under sustained reads.
+SMC = {
+    "TPCD": (BOT, 45.7, 90.0, 1.0),                                  # PCH at 1150 rpm (idle temperature)
+    **{f"TM{i}P": (BLOWER, 50.0, 85.0, 1.0) for i in range(9)},      # DIMM proximity
+    **{f"Tp{i}P": (BLOWER, 55.0, 80.0, 1.0) for i in range(3)},      # power supply
+}
+NVME = (BLOWER, 55.0, 1.0)             # internal flash (hwmon "nvme"): zone fan, target, band; emergency = crit - margin
+# Production devices' temperatures (health targets; emergency = crit - margin, or the default crit): zone fan by PCI
+# slot -- slots 5-8 sit behind the middle front fan. The AUX-bay disks' fan is not measured yet: MID until a zone test
+# places them.
+SLOT_ZONE = {"5": MID, "6": MID, "7": MID, "8": MID}
+PERIPH = {"nvme": (60.0, 1.0, 80.0), "mlx5": (80.0, 1.0, 105.0), "drivetemp": (40.0, 1.0, 60.0)}  # target, band, crit
+DISK_ZONE = MID
+WRITE_STEP = 25        # rpm; smaller changes are not written to the SMC
+READ_FAILS = 3         # consecutive failed reads before a sensor raises an alarm
+GPU_STALE = 10.0       # s; GPU readings older than this raise an alarm
+FAN_TOL = (150, 0.25)  # a fan more than max(150 rpm, 25 %) off its setting ...
+FAN_SETTLE = 20.0      # ... once it has had this long to get there ...
+FAN_FAIL = 30.0        # ... for this long raises an alarm
+OWNER_FAILS = 5        # consecutive loops with fan registers changed by someone else -> alarm
+HANDOVER = 10.0        # s to get every fan to read back manual at its setting after t2fanrd stops
+LOG_EVERY = 30.0       # s
+DISCOVER = 240.0       # s to wait at start for applesmc and every die's hwmon (amdgpu binds ~57 s into boot, after
+                       # resize-amdgpu-bars); the fans are not touched meanwhile. Dies still missing then: alarm.
+OVERRIDE = "/run/macpro-fand/override"
+
+# Test hooks (failure-path tests only): stall the GPU reader after N s; report fan N's tach as 0.
+TEST_STALL_GPU = float(os.environ.get("MACPRO_FAND_TEST_STALL_GPU", "0") or 0)
+TEST_DEAD_FAN = int(os.environ.get("MACPRO_FAND_TEST_DEAD_FAN", "0") or 0)
+
+
+# --------------------------------------------------------------- helpers
+def rds(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def rd(path, scale=1.0):
+    try:
+        return float(rds(path)) / scale
+    except (TypeError, ValueError):
+        return None
+
+
+def wr(path, val):
+    with open(path, "w") as f:
+        f.write(f"{val}\n")
+
+
+def temp_labels(d):
+    """label -> sysfs prefix, e.g. 'junction' -> .../temp2"""
+    return {rds(p): p[: -len("_label")] for p in glob.glob(d + "/temp*_label")}
+
+
+def hwmon_named(name):
+    return [h for h in sorted(glob.glob("/sys/class/hwmon/hwmon*")) if rds(h + "/name") == name]
+
+
+def pci_vendor(addr):
+    return rds(f"/sys/bus/pci/devices/{addr}/vendor")
+
+
+def pci_chain(path):
+    """PCI addresses (domain:bus:dev.fn) along a sysfs device path, root first."""
+    return [c for c in os.path.realpath(path).split("/") if len(c) == 12 and c[4] == ":" and c[7] == ":" and c[10] == "."]
+
+
+def pci_slot(path):
+    """The physical slot ("1".."8") a device sits behind, from /sys/bus/pci/slots/*/address ("3-2" is a second link of
+    slot 3); None for onboard devices."""
+    slots = {rds(a): os.path.basename(os.path.dirname(a)) for a in glob.glob("/sys/bus/pci/slots/*/address")}
+    for c in reversed(pci_chain(path)):
+        name = (slots.get(c[:-2]) or "").split("-")[0]
+        if name in ("1", "2", "3", "4", "5", "6", "7", "8"):
+            return name
+    return None
+
+
+def die_map():
+    """{short PCI address: MPX bay} of the GPU dies: DIES if configured, else every AMD display device (vendor 0x1002,
+    class 0x03xxxx -- present on the bus before amdgpu binds), its bay from its slot (MPX_BAY; elsewhere: bay 2)."""
+    if DIES:
+        return dict(DIES)
+    out = {}
+    for d in sorted(glob.glob("/sys/bus/pci/devices/*")):
+        if rds(d + "/vendor") == "0x1002" and (rds(d + "/class") or "").startswith("0x03"):
+            out[os.path.basename(d)[5:]] = MPX_BAY.get(pci_slot(d), 2)
+    return out
+
+
+def devices():
+    """Uncapped devices beyond the calibrated box: {'mellanox': cards, 'nvme': drives, 'disk': rotational disks}."""
+    mlx = {a[:-2] for a in (os.path.basename(d) for d in glob.glob("/sys/bus/pci/devices/*"))
+           if pci_vendor(a) == "0x15b3" and not os.path.exists(f"/sys/bus/pci/devices/{a}/physfn")}
+    nvme = [n for n in glob.glob("/sys/class/nvme/nvme*") if pci_vendor((pci_chain(n + "/device") or ["?"])[-1]) != "0x106b"]
+    disk = [b for b in glob.glob("/sys/block/sd*") if rds(b + "/queue/rotational") == "1"]
+    return {"mellanox": len(mlx), "nvme": len(nvme), "disk": len(disk)}
+
+
+def base():
+    """BASE plus the worst case of every uncapped device found (cached: devices are counted once per process)."""
+    global _BASE
+    if _BASE is None:
+        _BASE = BASE + sum(DEVICE_W[k] * n for k, n in devices().items())
+    return _BASE
+
+
+_BASE = None
+
+
+def level(g, dies, amount, bound, down):
+    """Water-fill `amount` W of die cap out of (down) or into these dies: the highest caps give first / the lowest
+    caps get first, each stopping at its bound (a floor going down, a ceiling going up). Returns the W moved."""
+    if not dies or amount <= 0:
+        return 0.0
+    moved = lambda L: sum(max(0.0, g[a] - max(L, bound[a])) if down else max(0.0, min(L, bound[a]) - g[a]) for a in dies)
+    lo, hi = (min(bound[a] for a in dies), max(g[a] for a in dies)) if down else \
+             (min(g[a] for a in dies), max(bound[a] for a in dies))
+    if moved(lo if down else hi) <= amount:
+        L = lo if down else hi
+    else:
+        a_, b_ = lo, hi
+        for _ in range(60):
+            mid = (a_ + b_) / 2
+            if (moved(mid) > amount) == down:
+                a_ = mid
+            else:
+                b_ = mid
+        L = b_ if down else a_
+    total = moved(L)
+    for a in dies:
+        g[a] = min(g[a], max(L, bound[a])) if down else max(g[a], min(L, bound[a]))
+    return total
+
+
+def find_smc():
+    cands = []
+    for h in hwmon_named("applesmc"):
+        cands += [h, h + "/device"]
+    cands += glob.glob("/sys/bus/acpi/devices/APP0001:*") + ["/sys/devices/platform/applesmc.768"]
+    return next((c for c in cands if os.path.exists(c + "/fan1_manual")), None)
+
+
+def ema(old, new, dt, tau):
+    return new if old is None else old + (new - old) * dt / (tau + dt)
+
+
+def cpu_target(w):
+    """CPU_TARGET at package power w (W): linear between the points, flat outside; the low end when w is unknown."""
+    (w0, t0), (w1, t1) = CPU_TARGET
+    if w is None or w <= w0:
+        return t0
+    return t1 if w >= w1 else t0 + (t1 - t0) * (w - w0) / (w1 - w0)
+
+
+def worst(vals):
+    vals = [v for v in vals if v is not None]
+    return max(vals) if vals else None
+
+
+def sane(v, default):
+    return v if v is not None and 60.0 <= v <= 130.0 else default
+
+
+def r1(v):
+    return None if v is None else round(v, 1)
+
+
+def notify(msg):
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if addr:
+        if addr.startswith("@"):
+            addr = "\0" + addr[1:]
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.sendall(msg.encode())
+
+
+CHILD_ENV = {k: v for k, v in os.environ.items() if k != "NOTIFY_SOCKET"}   # children never notify for us
+
+
+def systemctl(*a, **kw):
+    return subprocess.run(["systemctl", *a], env=CHILD_ENV, timeout=10, **kw)
+
+
+def unit_active(unit):
+    return systemctl("is-active", "--quiet", unit).returncode == 0
+
+
+def unit_exists(unit):
+    return systemctl("cat", unit, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def own_unit_restarting():
+    """True when this unit has a start/restart job pending (ExecStopPost of 'systemctl restart'): handing the fans to
+    t2fanrd then would, through Conflicts=, cancel our own restart."""
+    try:
+        cg = open("/proc/self/cgroup").read().strip().split("/")
+    except OSError:
+        return False
+    unit = next((c for c in reversed(cg) if c.endswith(".service")), None)
+    if unit is None:
+        return False
+    jobs = systemctl("list-jobs", "--no-legend", "--no-pager", unit, capture_output=True, text=True).stdout.split()
+    return any(t in jobs for t in ("start", "restart", "try-restart", "reload-or-start"))
+
+
+def log(**kv):
+    print(json.dumps(kv), flush=True)
+
+
+# --------------------------------------------------------------- classes
+class Governor:
+    """One zone's fan, from its sensors' (reading - target, band) pairs, C. Any sensor over its band: push up at
+    UP_GAIN per C of the largest excess. Every sensor under its band: ramp down at DOWN_GAIN per C of the smallest
+    margin, clipped to DOWN_MIN..DOWN_MAX. Otherwise hold. The rpm is the only state."""
+
+    def __init__(self, f):
+        self.f, self.rpm, self.err, self.rate = f, float(ZONES[f]["init"]), None, 0.0
+
+    def step(self, errs, dt):
+        self.err = max((e for e, _ in errs), default=None)
+        if not errs:                      # no reading: hold (a failed or stale sensor raises an alarm elsewhere)
+            self.rate = 0.0
+        elif any(e > b for e, b in errs):
+            self.rate = min(UP_MAX, UP_GAIN * max(e for e, b in errs if e > b))
+        elif all(e < -b for e, b in errs):
+            self.rate = -min(DOWN_MAX, max(DOWN_MIN, DOWN_GAIN * min(-e for e, _ in errs)))
+        else:
+            self.rate = 0.0
+        self.rpm = min(max(self.rpm + self.rate * dt, ZONES[self.f]["floor"]), CAP[self.f])
+        return self.rpm
+
+
+class Filter:
+    """Filtered value that tolerates a few failed readings in a row."""
+
+    def __init__(self, tau):
+        self.tau = tau
+        self.reset()
+
+    def reset(self):
+        self.raw = self.val = None
+        self.fails = 0
+
+    def feed(self, v, dt):
+        if v is None:
+            self.fails += 1
+            return self.fails < READ_FAILS
+        self.fails, self.raw = 0, v
+        self.val = ema(self.val, v, dt, self.tau)
+        return True
+
+
+class Sensor(Filter):
+    """Filter over a sysfs file read in the control loop (applesmc, coretemp: never amdgpu)."""
+
+    def __init__(self, path, scale, tau):
+        super().__init__(tau)
+        self.path, self.scale = path, scale
+
+    def update(self, dt):
+        return self.feed(rd(self.path, self.scale), dt)
+
+
+class Die:
+    def __init__(self, addr, bay):
+        devs = glob.glob("/sys/bus/pci/devices/*:" + addr)
+        hws = glob.glob(devs[0] + "/hwmon/hwmon*") if devs else []
+        if not hws:
+            raise RuntimeError(f"no amdgpu hwmon for {addr}")
+        self.addr, self.bay, self.dev = addr, bay, devs[0]
+        lab = temp_labels(hws[0])
+        pw = hws[0] + "/power1_average"
+        if not os.path.exists(pw):
+            pw = hws[0] + "/power1_input"
+        self.paths = (lab["junction"] + "_input", lab["mem"] + "_input", pw)
+        self.tj, self.tm, self.p = Filter(4.0), Filter(4.0), Filter(10.0)
+        self.jcrit = sane(rd(lab["junction"] + "_crit", 1000), 105.0)
+        self.mcrit = sane(rd(lab["mem"] + "_crit", 1000), 95.0)
+
+    def read(self):
+        """Worker thread only: (junction C, HBM C, power W), None where a read failed."""
+        return (rd(self.paths[0], 1000), rd(self.paths[1], 1000), rd(self.paths[2], 1e6))
+
+
+class GpuReader(threading.Thread):
+    """Reads every die once per PERIOD; the control loop takes the latest snapshot and checks its age."""
+
+    def __init__(self, dies):
+        super().__init__(daemon=True, name="gpu-reader")
+        self.dies, self.lock, self.snap, self.t = dies, threading.Lock(), None, None
+        self.t0 = time.monotonic()
+
+    def run(self):
+        while True:
+            if TEST_STALL_GPU and time.monotonic() - self.t0 > TEST_STALL_GPU:
+                threading.Event().wait()          # test hook: behave like a read stuck in the driver
+            vals = {d.addr: d.read() for d in self.dies}
+            with self.lock:
+                self.snap, self.t = vals, time.monotonic()
+            time.sleep(PERIOD)
+
+    def latest(self):
+        with self.lock:
+            return self.snap, (None if self.t is None else time.monotonic() - self.t)
+
+
+class SmcKey:
+    """One SMC key through applesmc-t2's two-step key_at_index interface, under LOCK, an flock that every tool reading
+    SMC keys this way should take (an interleaved reader gets another key's data). read() -> float or None, never
+    blocks for long."""
+    LOCK = "/run/lock/applesmc-keys.lock"
+
+    def __init__(self, smc, key):
+        self.smc, self.key, self.idx = smc, key, None
+        try:
+            n = int(rds(smc + "/key_count"))
+        except (TypeError, ValueError):
+            return
+        with open(self.LOCK, "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            for i in range(n):
+                wr(smc + "/key_at_index", i)
+                if rds(smc + "/key_at_index_name") == key:
+                    self.idx = i
+                    break
+
+    def read(self):
+        if self.idx is None:
+            return None
+        try:
+            with open(self.LOCK, "w") as lk:
+                for _ in range(20):                   # up to ~200 ms for another reader to finish
+                    try:
+                        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        time.sleep(0.01)
+                else:
+                    return None
+                wr(self.smc + "/key_at_index", self.idx)
+                if rds(self.smc + "/key_at_index_name") != self.key:
+                    return None
+                data = open(self.smc + "/key_at_index_data", "rb").read()
+                return struct.unpack("<f", data[:4])[0] if len(data) >= 4 else None
+        except OSError:
+            return None
+
+
+def write_async(path, value, deadline=10.0):
+    """Write in a background thread (amdgpu power-cap writes go to the SMU, which can hang); True if it completed."""
+    res = []
+
+    def go():
+        try:
+            wr(path, value)
+            res.append(True)
+        except OSError:
+            res.append(False)
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(deadline)
+    return bool(res and res[0])
+
+
+def budget_ready():
+    return None not in (BASE, K_GPU, K_CPU)
+
+
+def static_safe():
+    """{'gpu': W per die, 'pl1': W}: the limits used when the daemon is not running (stop hook)."""
+    lim = BUDGET_LIMIT - BUDGET_MARGIN
+    g = STATIC_SAFE["gpu"]
+    pl1 = STATIC_SAFE["pl1"] or min(CPU_PL1["max"], (lim - base() - K_GPU * 4 * g) / K_CPU)
+    return {"gpu": g, "pl1": max(CPU_PL1["floor"], pl1)}
+
+
+def write_static_safe():
+    """Stop hook: GPU caps and PL1 to their static-safe values (lowering writes first)."""
+    if not budget_ready():
+        return
+    ss = static_safe()
+    caps = sorted(glob.glob("/sys/bus/pci/devices/*/hwmon/hwmon*/power1_cap"))
+    caps = [c for c in caps if any(a in c for a in die_map())]
+    order = [(RAPL_PL1, ss["pl1"]), (RAPL_PL2, ss["pl1"])] + [(c, ss["gpu"]) for c in caps]
+    order.sort(key=lambda x: -((rd(x[0], 1e6) or 0) - x[1]))          # lowering writes (biggest decrease) first
+    for path, w in order:
+        ok = write_async(path, int(w * 1e6))
+        log(static_safe={path: [round(w), ok]})
+
+
+class Budget:
+    """The 1228 W invariant over the GPU die caps and the CPU's PL1 (see the module docstring)."""
+
+    def __init__(self, cap_paths, dry):
+        self.paths, self.dry = cap_paths, dry                 # {die addr: power1_cap path}
+        self.limit = TEST_BUDGET or (BUDGET_LIMIT - BUDGET_MARGIN)
+        self.backstop = TEST_BACKSTOP or BACKSTOP
+        self.gpu = {a: float(GPU_CAP["init"]) for a in cap_paths}
+        self.pl1 = float(CPU_PL1["max"])                      # fit() brings it down to what the invariant allows
+        self.pin = None                                       # W per die while an override pins the GPU caps
+        self.tcap = {a: GPU_CAP["init"] + CAP_LEAD for a in cap_paths}   # working-temperature ceilings (thermal())
+        self.written = {}
+        self.over_n, self.floor_until, self.last, self.failed = 0, 0.0, 0.0, None
+        self.dc = None
+        self.fit()
+
+    def reset(self):
+        """Back to the default allocation (GPUs at their init cap, PL1 as large as the invariant allows): at start and
+        when an override pin ends (without demand the rebalancer would leave the pinned limits in place)."""
+        self.gpu = {a: float(GPU_CAP["init"]) for a in self.paths}
+        self.pl1 = float(CPU_PL1["max"])
+        self.fit()
+
+    def cost(self, gpu=None, pl1=None):
+        gpu = self.gpu if gpu is None else gpu
+        return base() + K_GPU * sum(gpu.values()) + K_CPU * (self.pl1 if pl1 is None else pl1)
+
+    def room(self, gpu):
+        """Largest PL1 the invariant allows beside these GPU caps (clipped to the CPU's range)."""
+        return min(CPU_PL1["max"], (self.limit - base() - K_GPU * sum(gpu.values())) / K_CPU)
+
+    def fit(self):
+        """Make the current allocation satisfy the invariant: PL1 first down to its floor, then the GPUs evenly."""
+        self.pl1 = max(CPU_PL1["floor"], min(self.pl1, self.room(self.gpu)))
+        while self.cost() > self.limit + 1e-6:
+            hi = [a for a in self.gpu if self.gpu[a] > GPU_CAP["floor"]]
+            if not hi:
+                break
+            for a in hi:
+                self.gpu[a] = max(GPU_CAP["floor"], self.gpu[a] - 1)
+
+    def apply(self):
+        """Lowering writes first; any failed lowering write blocks the raising ones (the invariant may not hold)."""
+        if self.dry:
+            return True
+        want = {p: int(self.gpu[a] * 1e6) for a, p in self.paths.items()}
+        want[RAPL_PL1] = want[RAPL_PL2] = int(self.pl1 * 1e6)
+        cur = {p: rd(p) for p in want}
+        down = [p for p in want if cur[p] is None or want[p] < cur[p] - 1e5]
+        up = [p for p in want if p not in down and abs(want[p] - (cur[p] or 0)) > 1e5]
+        up.sort(key=lambda p: p != RAPL_PL2)                  # PL2 never below PL1 on the way up
+        for p in down:
+            if not write_async(p, want[p]):
+                self.failed = p
+                return False
+            self.written[p] = want[p]
+        for p in up:
+            if write_async(p, want[p]):
+                self.written[p] = want[p]
+        for p in want:
+            self.written.setdefault(p, want[p])
+        self.failed = None
+        return True
+
+    def external(self):
+        """Paths whose limit someone else changed since we wrote it."""
+        return [p for p, uw in self.written.items() if (rd(p) or 0) and abs(rd(p) - uw) > 1e6]
+
+    def thermal(self, dies, fan_full, dt):
+        """Working-temperature ceilings: over T_WORK (or HBM_WORK) + band a die's ceiling comes down from its present
+        draw -- once its bay fan is at full speed, or at once CAP_EARLY over; under - band it goes back up slowly
+        (to at most CAP_LEAD over the allocation); inside the band it holds. dies: {addr: (junction C, HBM C, W, bay)}."""
+        for a, (tj, tm, w, bay) in dies.items():
+            if tj is None or a not in self.tcap:
+                continue
+            err = max(tj - T_WORK[0], (tm - HBM_WORK) if tm is not None else tj - T_WORK[0])
+            if err > T_WORK[1] and (fan_full.get(bay) or err > T_WORK[1] + CAP_EARLY):
+                start = min(self.tcap[a], w + 5.0) if w is not None else self.tcap[a]
+                self.tcap[a] = start - min(CAP_DOWN[1], CAP_DOWN[0] * (err - T_WORK[1])) * dt
+            elif err < -T_WORK[1] and self.tcap[a] < self.gpu[a] + CAP_LEAD:    # no windup: a ceiling only rises
+                self.tcap[a] = min(self.gpu[a] + CAP_LEAD,                       # while it is near the allocation
+                                   self.tcap[a] + min(CAP_UP[1], CAP_UP[0] * (-err - T_WORK[1])) * dt)
+            self.tcap[a] = min(float(GPU_CAP["max"]), max(float(GPU_CAP["floor"]), self.tcap[a]))
+
+    def backstop_check(self, dc, now):
+        """Measured DC over BACKSTOP on BACKSTOP_N samples in a row: every limit to its floor, hold BACKSTOP_HOLD s."""
+        self.dc = dc
+        self.over_n = self.over_n + 1 if (dc is not None and dc > self.backstop) else 0
+        if self.over_n >= BACKSTOP_N:
+            self.gpu = {a: float(GPU_CAP["floor"]) for a in self.gpu}
+            self.pl1 = float(CPU_PL1["floor"])
+            self.floor_until = now + BACKSTOP_HOLD
+            self.apply()
+            self.over_n = 0
+            return True
+        return False
+
+    def rebalance(self, now, die_w, cpu_w):
+        """CPU first. A saturated CPU (>= SAT of PL1) gets at least its default share at once, then
+        STEP_FRAC more per move, funded from free budget, then idle dies (toward their use + 30 %), then every die
+        evenly. Saturated dies get free budget, idle siblings' budget, and the CPU's PL1 above CPU_KEEP of its use --
+        never more, so a busy CPU keeps its headroom. Returns a short log string or None."""
+        if now < self.floor_until:
+            return None
+        if self.pin is not None:                              # (GPU W or None, PL1 W or None): fixed limits, still
+            gp, pp = self.pin                                 # inside the invariant (a pin that does not fit shrinks)
+            g = {a: float(gp) for a in self.gpu} if gp else dict(self.gpu)
+            if pp:
+                floor = min(pp, CPU_PL1["floor"])
+                while self.room(g) < floor and min(g.values()) > GPU_CAP["floor"]:
+                    g = {a: v - 1 for a, v in g.items()}
+                self.gpu, self.pl1 = g, max(10.0, min(pp, self.room(g)))
+            else:
+                while self.room(g) < CPU_PL1["floor"] and min(g.values()) > GPU_CAP["floor"]:
+                    g = {a: v - 1 for a, v in g.items()}
+                self.gpu, self.pl1 = g, max(CPU_PL1["floor"], self.room(g))
+            return None
+        lo = GPU_CAP["floor"]
+        g = {a: min(v, self.tcap[a]) for a, v in self.gpu.items()}   # a hot die's ceiling binds at once
+        pl1 = self.pl1
+        free = lambda: self.limit - self.cost(g, pl1)
+        idle = [a for a in g if die_w.get(a) is not None and die_w[a] <= IDLE * g[a] and g[a] > lo]
+        cpu_sat = cpu_w is not None and cpu_w >= SAT * pl1 and pl1 < CPU_PL1["max"]
+        if cpu_sat:
+            dflt = max(CPU_PL1["floor"], self.room({a: float(GPU_CAP["init"]) for a in g}))
+            target = min(CPU_PL1["max"], max(dflt, pl1 + max(10.0, STEP_FRAC * pl1)))
+            need = (K_CPU * (target - pl1) - max(0.0, free())) / K_GPU     # die W to give
+            need -= level(g, idle, need, {a: max(lo, die_w[a] * 1.3) for a in idle}, True)
+            level(g, list(g), need, {a: lo for a in g}, True)             # then every die evenly
+            pl1 = min(target, pl1 + max(0.0, free()) / K_CPU)
+        else:
+            want = [a for a in g if die_w.get(a) is not None and die_w[a] >= SAT * g[a] and g[a] < self.tcap[a] - 0.5]
+            for a in idle if want else []:
+                g[a] = max(lo, die_w[a] * 1.3, g[a] - max(5.0, STEP_FRAC * g[a]))
+            keep = pl1 if cpu_w is None else max(CPU_PL1["floor"], cpu_w * CPU_KEEP[0] + CPU_KEEP[1])
+            ceil = {a: min(self.tcap[a], g[a] + max(5.0, STEP_FRAC * g[a])) for a in want}   # (empty: no-op)
+            need = K_GPU * sum(ceil[a] - g[a] for a in want)
+            short = need - max(0.0, free())
+            if short > 0 and pl1 > keep:                       # the CPU lends only what it does not use
+                pl1 -= min(pl1 - keep, short / K_CPU)
+            level(g, want, max(0.0, free()) / K_GPU, ceil, False)            # the lowest caps first
+        pl1 = min(CPU_PL1["max"], pl1 + max(0.0, free()) / K_CPU)     # whatever the dies do not hold: the CPU's
+        if self.cost(g, pl1) > self.limit + 1e-6:              # never: guard against arithmetic slips
+            return "rebalance skipped: invariant"
+        changed = abs(pl1 - self.pl1) >= 1 or any(abs(g[a] - self.gpu[a]) >= 1 for a in g)
+        self.gpu, self.pl1 = g, pl1
+        why = "cpu wants" if cpu_sat else ("gpu wants" if want else "thermal ceilings")
+        return f"rebalance ({why}): gpu {[round(v) for v in g.values()]} pl1 {round(pl1)}" if changed else None
+
+
+def parse_override():
+    """-> (mode, rpm dict or None, note) from OVERRIDE; ('auto', None, '') when absent, expired or malformed."""
+    try:
+        st = os.stat(OVERRIDE)
+        words = open(OVERRIDE).read().split()
+    except OSError:
+        return "auto", None, "", None
+    ttl = [w for w in words if w.startswith("ttl=")]
+    pin = [w for w in words if w.startswith("gpu=")]
+    ppin = [w for w in words if w.startswith("pl1=")]
+    words = [w for w in words if not w.startswith(("ttl=", "gpu=", "pl1="))]
+    try:
+        pin = min(max(float(pin[0][4:]), GPU_CAP["floor"]), GPU_CAP["max"]) if pin else None
+    except ValueError:
+        pin = None
+    try:
+        ppin = min(max(float(ppin[0][4:]), 10.0), CPU_PL1["max"]) if ppin else None   # experiments may go under the floor
+    except ValueError:
+        ppin = None
+    pin = (pin, ppin) if (pin is not None or ppin is not None) else None
+    try:
+        if ttl and time.time() - st.st_mtime > float(ttl[0][4:]):
+            return "auto", None, "override expired", None
+        pn = (f" gpu={pin[0]:.0f}" if pin and pin[0] else "") + (f" pl1={pin[1]:.0f}" if pin and pin[1] else "")
+        if not words or words[0] == "auto":
+            return "auto", None, ("override" + pn) if pin else "", pin
+        if words[0] == "max" and len(words) == 1:
+            return "max", None, "override max" + pn, pin
+        if words[0] == "hold" and len(words) == 1 + len(CAP):
+            rpm = {f: min(max(float(w), MIN_RPM[f]), CAP[f]) for f, w in zip(sorted(CAP), words[1:])}
+            return "hold", rpm, "override hold" + pn, pin
+    except ValueError:
+        pass
+    return "auto", None, f"override ignored (malformed: {' '.join(words)[:60]})", None
+
+
+# ------------------------------------------------------------------ main
+CONFIGURABLE = ("ZONES", "BAY_TARGET", "HBM_TARGET", "CPU_TARGET", "CPU_BAND", "CPU_TARGET_TAU", "BAND", "SMC", "NVME",
+                "BUDGET_LIMIT", "BUDGET_MARGIN", "BASE", "K_GPU", "K_CPU", "GPU_CAP", "CPU_PL1", "STATIC_SAFE",
+                "CPU_KEEP", "T_WORK", "HBM_WORK", "DEVICE_W", "SLOT_ZONE", "PERIPH", "DISK_ZONE", "DIES", "MPX_BAY",
+                "BACKSTOP")
+
+
+def load_config(path):
+    """NAME = value settings (Python literals) for the names in CONFIGURABLE; '#' starts a comment and an indented line
+    continues the setting above it. A dict setting updates the default entry by entry (ZONES = {4: {"floor": 700}}
+    changes one floor). A setting that does not parse, names something else or changes a value's type is reported and
+    ignored: the defaults stay."""
+    import ast
+    try:
+        lines = open(path).read().splitlines()
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        return [f"{path}: {e}"]
+    errors, g, items = [], globals(), []
+    for n, line in enumerate(lines, 1):                    # an indented line continues the setting above it
+        text = "" if line.lstrip().startswith("#") else line.split("#", 1)[0].rstrip()
+        if text.strip() and text[0] in " \t" and items:
+            items[-1][1] += " " + text.strip()
+        elif text.strip():
+            items.append([n, text.strip()])
+    for n, line in items:
+        name, eq, val = line.partition("=")
+        name = name.strip()
+        try:
+            if not eq or name not in CONFIGURABLE:
+                raise ValueError(f"unknown setting {name!r}")
+            v = ast.literal_eval(val.strip())
+            old = g[name]
+            if isinstance(old, float) and isinstance(v, int):
+                v = float(v)
+            if type(v) is not type(old) and not (isinstance(old, (int, float)) and isinstance(v, (int, float))):
+                raise ValueError(f"{name} must be a {type(old).__name__}")
+            if isinstance(old, dict):                       # a dict setting updates the default, entry by entry
+                v = {**old, **{k: ({**old[k], **x} if isinstance(old.get(k), dict) and isinstance(x, dict) else x)
+                               for k, x in v.items()}}
+            g[name] = v
+        except (ValueError, SyntaxError) as e:
+            errors.append(f"{path}:{n}: {e}; ignored")
+    return errors
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="macpro-fand", description="Mac Pro 7,1 zone fan control and power budget")
+    ap.add_argument("--dry-run", action="store_true", help="compute and log, write nothing")
+    ap.add_argument("--release", action="store_true", help="hand the fans to t2fanrd (every fan to its cap first)")
+    ap.add_argument("--stopped", action="store_true", help="systemd ExecStopPost hook")
+    ap.add_argument("--config", default=CONFIG, help=f"configuration file (default {CONFIG})")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    args = ap.parse_args()
+    for e in load_config(args.config):
+        log(error=e)
+    global T_WORK
+    if float(os.environ.get("MACPRO_FAND_TEST_TWORK", "0") or 0):            # test hook: working temperature, C
+        T_WORK = (float(os.environ["MACPRO_FAND_TEST_TWORK"]), T_WORK[1])
+    if "macpro7,1" not in (rds("/sys/class/dmi/id/product_name") or "").lower() and not args.stopped:
+        log(error="not a MacPro7,1: exiting")
+        sys.exit(EX_NOHW)
+
+    smc = find_smc()
+    if smc is None and not (args.release or args.stopped):
+        end = time.monotonic() + DISCOVER
+        while smc is None and time.monotonic() < end:
+            time.sleep(2)
+            smc = find_smc()
+    if smc is None:
+        log(error="applesmc fan attributes not found (applesmc-t2 driver loaded?)")
+        sys.exit(EX_NOHW)
+
+    def fan(f, key):
+        return f"{smc}/fan{f}_{key}"
+
+    def full():
+        """Every fan to its cap. Never the SMC's automatic mode."""
+        for f in CAP:
+            try:
+                wr(fan(f, "manual"), 1)
+                wr(fan(f, "output"), CAP[f])
+            except OSError as e:
+                log(error=f"fan{f} write failed: {e}")
+
+    def handback():
+        """Clean stop: cap first, then t2fanrd (if installed) takes over with its own curve, unless this stop is
+        half of a restart."""
+        full()
+        if unit_exists("t2fanrd.service") and not own_unit_restarting():
+            systemctl("start", "--no-block", "t2fanrd.service")
+
+    if args.release:
+        write_static_safe()
+        return handback()
+    if args.stopped:  # systemd sets SERVICE_RESULT for ExecStopPost
+        if os.environ.get("SERVICE_RESULT") == "success":
+            handback()
+        else:
+            full()
+        return write_static_safe()
+
+    def discover():
+        found, missing = [], []
+        for a, b in die_map().items():
+            try:
+                found.append(Die(a, b))
+            except (RuntimeError, KeyError, OSError, IndexError):
+                missing.append(a)
+        return found, missing
+
+    dies, missing_dies = discover()
+    end = time.monotonic() + DISCOVER
+    while missing_dies and time.monotonic() < end:
+        notify(f"STATUS=waiting for amdgpu: {' '.join(missing_dies)}")
+        time.sleep(2)
+        dies, missing_dies = discover()
+    if missing_dies:
+        log(error=f"dies missing after {DISCOVER:.0f} s: {missing_dies}; running with every fan at its cap")
+    core = hwmon_named("coretemp")
+    pkg = temp_labels(core[0]).get("Package id 0") if core else None
+    if pkg is None:
+        sys.exit("coretemp 'Package id 0' not found")
+    cpu = Sensor(pkg + "_input", 1000, 4.0)
+    cpu_crit = sane(rd(pkg + "_crit", 1000), 92.0)
+    smc_lab = temp_labels(smc)
+    missing = [k for k in SMC if k not in smc_lab]
+    if missing:
+        sys.exit(f"SMC sensors not found: {missing}")
+    smc_s = {k: (z, t, e, b, Sensor(smc_lab[k] + "_input", 1000, 10.0)) for k, (z, t, e, b) in SMC.items()}
+    # internal flash (Apple vendor id) on the blower; production devices by slot (PERIPH), each with its own target
+    if any(rds(b + "/queue/rotational") == "1" for b in glob.glob("/sys/block/sd*")) and not hwmon_named("drivetemp"):
+        subprocess.run(["modprobe", "drivetemp"], capture_output=True)
+    for name, (tgt, band, crit0) in PERIPH.items():
+        for h in hwmon_named(name):
+            if not os.path.exists(h + "/temp1_input"):
+                continue
+            pci = (pci_chain(h + "/device") or ["?"])[-1]
+            crit = rd(h + "/temp1_crit", 1000)
+            crit = crit if crit is not None and 50.0 <= crit <= 130.0 else crit0
+            if name == "nvme" and pci_vendor(pci) == "0x106b":
+                smc_s["nvme"] = (NVME[0], NVME[1], crit - EMERG_MARGIN, NVME[2], Sensor(h + "/temp1_input", 1000, 10.0))
+                continue
+            slot = pci_slot(h + "/device")
+            zone = DISK_ZONE if name == "drivetemp" else SLOT_ZONE.get(slot, MID)
+            smc_s[f"{name}:{os.path.basename(os.path.realpath(h + '/device'))}"] = (
+                zone, tgt, crit - EMERG_MARGIN, band, Sensor(h + "/temp1_input", 1000, 10.0))
+    fan_in = {f: Sensor(fan(f, "input"), 1, 0.0) for f in CAP}
+
+    log(fans={f: rds(fan(f, "label")) for f in CAP},
+        crit={**{d.addr: [d.jcrit, d.mcrit] for d in dies}, "cpu": cpu_crit},
+        zones={f: dict(z, cap=CAP[f]) for f, z in ZONES.items()}, bay_target=BAY_TARGET, band=BAND,
+        smc=sorted(SMC), extra={k: v[:3] for k, v in smc_s.items() if k not in SMC}, dry_run=args.dry_run)
+
+    # Exclusive ownership. Under systemd, Conflicts=/After= stop t2fanrd before we start; by hand, refuse.
+    if not args.dry_run:
+        end = time.monotonic() + (15 if "INVOCATION_ID" in os.environ else 0)
+        while unit_active("t2fanrd.service") and time.monotonic() < end:
+            time.sleep(0.5)
+        if unit_active("t2fanrd.service"):
+            sys.exit("t2fanrd is running: stop it first (the unit file has Conflicts=t2fanrd.service)")
+
+    gov = {f: Governor(f) for f in CAP}
+    cmd = {f: gov[f].rpm for f in CAP}
+    budget = None
+    if budget_ready():
+        cap_paths = {d.addr: os.path.dirname(d.paths[0]) + "/power1_cap" for d in dies}
+        budget = Budget(cap_paths, args.dry_run)
+        smc_dc = SmcKey(smc, "PZ0G")
+        if not args.dry_run and not budget.apply():
+            log(error=f"budget write failed at start: {budget.failed}")
+        log(budget={"limit": budget.limit, "backstop": budget.backstop, "gpu": [round(v) for v in budget.gpu.values()],
+                    "pl1": round(budget.pl1), "cost": round(budget.cost()), "dc_key": smc_dc.idx is not None,
+                    "base": base(), "devices": devices(),
+                    "static_safe": static_safe()})
+    else:
+        log(budget="disabled: BASE/K_GPU/K_CPU not calibrated")
+    rapl_e, pkg_w = [None, None], None
+    last_budget = 0.0
+    written = {f: None for f in CAP}
+    ref = {f: (None, 0.0) for f in CAP}       # (setting the fan is converging on, since when)
+    bad_since = {f: None for f in CAP}
+    good_since = {f: None for f in CAP}
+    failed = {f: False for f in CAP}          # latched until the fan follows its setting again for FAN_FAIL
+    owner_fails = 0
+    gpu = GpuReader(dies)
+    gpu.start()
+
+    def put(f, rpm):
+        if args.dry_run:
+            return
+        wr(fan(f, "manual"), 1)
+        wr(fan(f, "output"), rpm)
+
+    def take_over():
+        """Write the floors until every fan reads back manual at its setting (t2fanrd's exit can reset a fan to
+        automatic after our first write)."""
+        end = time.monotonic() + HANDOVER
+        while time.monotonic() < end:
+            for f in CAP:
+                put(f, int(cmd[f]))
+            time.sleep(1.0)
+            if all(rds(fan(f, "manual")) == "1" and abs((rd(fan(f, "output")) or 0) - int(cmd[f])) <= 5 for f in CAP):
+                for f in CAP:
+                    written[f] = int(cmd[f])
+                return True
+        return False
+
+    def stop(*_):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    if not args.dry_run and not take_over():
+        full()
+        sys.exit("fans do not hold manual settings after the handover: left at the cap")
+    notify("READY=1")
+    last = time.monotonic()
+    last_log = -LOG_EVERY
+    last_note = ""
+    try:
+        while True:
+            time.sleep(PERIOD)
+            now = time.monotonic()
+            dt, last = min(now - last, 5 * PERIOD), now
+            alarms = []
+            ez = {f: [] for f in CAP}              # per zone: (reading - target) of every sensor it answers to
+            mode, hold, note, pin = parse_override()
+
+            # GPU dies: worst junction and HBM error per bay, from the reader's latest snapshot
+            snap, age = gpu.latest()
+            alarms += [f"die {a} missing" for a in missing_dies]
+            if dies and (age is None or age > GPU_STALE):
+                alarms.append("gpu stale" if age is not None else "gpu no data")
+            tj, tm = {1: [], 2: []}, {1: [], 2: []}
+            for d in dies:                         # (Vega 20 here has no runtime PM: the dies never suspend)
+                if snap is None or age is None or age > GPU_STALE:
+                    break
+                for flt, v in zip((d.tj, d.tm, d.p), snap[d.addr]):
+                    if not flt.feed(v, dt):
+                        alarms.append("read " + d.addr)
+                if None in (d.tj.raw, d.tm.raw, d.p.val):
+                    continue
+                if d.tj.raw >= d.jcrit - EMERG_MARGIN or d.tm.raw >= d.mcrit - EMERG_MARGIN:
+                    alarms.append("hot " + d.addr)
+                tj[d.bay].append(d.tj.val)
+                tm[d.bay].append(d.tm.val)
+            bay_t = {b: (sum(v) / len(v) if v else None) for b, v in tj.items()}
+            if budget and snap is not None and age is not None and age <= GPU_STALE:
+                budget.thermal({d.addr: (d.tj.val, d.tm.val, d.p.val, d.bay) for d in dies},
+                               {b: gov[f].rpm >= CAP[f] - WRITE_STEP for b, f in BAY_FAN.items()}, dt)
+            for b, f in BAY_FAN.items():
+                if bay_t[b] is not None:
+                    ez[f].append((bay_t[b] - BAY_TARGET, BAND))
+                if tm[b]:
+                    ez[f].append((max(tm[b]) - HBM_TARGET, BAND))
+
+            # CPU package -> top front fan, at a target that follows package power
+            e = rd(RAPL_E)
+            cpu_w = None
+            if e is not None and rapl_e[0] is not None and e >= rapl_e[1]:
+                cpu_w = (e - rapl_e[1]) / 1e6 / (now - rapl_e[0])
+                pkg_w = ema(pkg_w, cpu_w, dt, CPU_TARGET_TAU)
+            rapl_e[:] = [now, e]
+            if not cpu.update(dt):
+                alarms.append("read cpu")
+            if cpu.raw is not None:
+                if cpu.raw >= cpu_crit - 3.0:
+                    alarms.append("hot cpu")
+                ez[TOP].append((cpu.val - cpu_target(pkg_w), CPU_BAND))
+
+            # SMC (and flash) sensors
+            for k, (zone, tgt, emerg, band, s) in smc_s.items():
+                if not s.update(dt):
+                    alarms.append("read " + k)
+                if s.raw is None:
+                    continue
+                if s.raw >= emerg:
+                    alarms.append("hot " + k)
+                ez[zone].append((s.val - tgt, band))
+
+            # power budget: backstop every loop, reallocation every BUDGET_PERIOD (never on stale GPU data)
+            if budget:
+                dc = smc_dc.read()
+                if budget.backstop_check(dc, now):
+                    alarms.append(f"power backstop: DC {dc:.0f} W > {budget.backstop:.0f} W, every limit to its floor")
+                ext = [] if args.dry_run else budget.external()
+                if ext:
+                    log(budget_note=f"limits changed by someone else, ours restored: {ext}")
+                    budget.apply()
+                if budget.pin is not None and pin is None:
+                    budget.reset()
+                    budget.apply()
+                    log(budget_note="override pin ended: default allocation restored")
+                budget.pin = pin
+                gpu_ok = snap is not None and age is not None and age <= GPU_STALE
+                if now - last_budget >= BUDGET_PERIOD and gpu_ok:
+                    last_budget = now
+                    die_w = {d.addr: d.p.raw for d in dies}
+                    msg = budget.rebalance(now, die_w, cpu_w)
+                    if msg or budget.pin is not None:
+                        budget.apply()
+                    if msg:
+                        log(budget_note=msg, dc=r1(dc), cpu_w=r1(cpu_w))
+                if budget.failed:
+                    alarms.append(f"budget write failed: {budget.failed}")
+
+            # fans: following their settings, and nobody else writing them
+            for f in CAP:
+                if not fan_in[f].update(dt):
+                    alarms.append(f"read fan{f}")
+                tach = 0.0 if f == TEST_DEAD_FAN else fan_in[f].raw
+                if written[f] is None or args.dry_run:
+                    continue
+                if ref[f][0] is None or abs(written[f] - ref[f][0]) > 100:
+                    ref[f] = (written[f], now)
+                off = tach is None or abs(tach - written[f]) > max(FAN_TOL[0], FAN_TOL[1] * written[f])
+                if off and (failed[f] or now - ref[f][1] > FAN_SETTLE):
+                    good_since[f] = None
+                    bad_since[f] = bad_since[f] or now
+                    if now - bad_since[f] > FAN_FAIL:
+                        failed[f] = True
+                elif not off:
+                    bad_since[f] = None
+                    good_since[f] = good_since[f] or now
+                    if failed[f] and now - good_since[f] > FAN_FAIL:
+                        failed[f] = False
+                if failed[f]:
+                    alarms.append(f"fan{f} at {tach} rpm, set {written[f]}")
+            if not args.dry_run:
+                changed = [f for f in CAP if written[f] is not None and (
+                    rds(fan(f, "manual")) != "1" or abs((rd(fan(f, "output")) or 0) - written[f]) > 5)]
+                owner_fails = owner_fails + 1 if changed else 0
+                if changed:
+                    for f in changed:                # re-assert; persistent changes mean a second writer
+                        try:
+                            put(f, written[f])
+                        except OSError as e:
+                            alarms.append(f"write fan{f}: {e}")
+                    if owner_fails >= OWNER_FAILS:
+                        alarms.append(f"fans {changed} changed by another writer")
+
+            # governors, override, emergency. Under an alarm or "max" every fan goes to its cap at once and the
+            # governors restart from there, so they ramp down slowly afterwards; a hold sets each fan exactly and
+            # the governors continue from the held rpm.
+            for f in CAP:
+                gov[f].step(ez[f], dt)
+                if alarms or mode == "max":
+                    gov[f].rpm = float(CAP[f])
+                elif mode == "hold":
+                    gov[f].rpm = hold[f]
+                cmd[f] = gov[f].rpm
+
+            # quantise, write
+            for f in CAP:
+                rpm = int(round(cmd[f]))
+                if written[f] is None or abs(rpm - written[f]) >= WRITE_STEP or (
+                        gov[f].rate == 0.0 and rpm != written[f]):
+                    try:
+                        put(f, rpm)
+                        written[f] = rpm
+                    except OSError as e:
+                        alarms.append(f"write fan{f}: {e}")
+
+            notify("WATCHDOG=1")
+            if alarms or note != last_note or now - last_log >= LOG_EVERY:
+                last_log, last_note = now, note
+                log(alarms=alarms, mode=mode, note=note or None,
+                    dies={d.addr: [r1(d.tj.val), r1(d.tm.val), r1(d.p.val)] for d in dies},
+                    gpu_age=r1(age), cpu=[r1(cpu.val), r1(cpu_target(pkg_w)), r1(pkg_w)],
+                    bays={b: r1(t) for b, t in bay_t.items()},
+                    smc={k: r1(s[-1].val) for k, s in smc_s.items()},
+                    zones={f: [r1(gov[f].err), round(gov[f].rate, 2), int(gov[f].rpm)] for f in CAP}, rpm=written,
+                    budget=(None if not budget else {"gpu": [round(v) for v in budget.gpu.values()],
+                            "pl1": round(budget.pl1), "cost": round(budget.cost()), "dc": r1(budget.dc),
+                            "tcap": [round(v) for v in budget.tcap.values()]}),
+                    tach={f: fan_in[f].raw for f in CAP})
+    finally:
+        # Under systemd, ExecStopPost decides; run by hand, cap first and hand back to t2fanrd.
+        if not args.dry_run and "INVOCATION_ID" not in os.environ:
+            write_static_safe()
+            handback()
+
+
+if __name__ == "__main__":
+    main()

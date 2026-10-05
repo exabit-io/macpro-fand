@@ -1,0 +1,38 @@
+# macpro-fand.service -- installed by the macpro-fand package.
+#
+# Zone fan control and the 1228 W power budget for a Mac Pro 7,1 (2019).
+# Exactly one process may own the fans: starting this unit stops t2fanrd,
+# and a clean stop hands the fans back to t2fanrd (every fan at its cap
+# first). A failed run always ends with every fan at its cap. The fans are
+# never put in the SMC's automatic mode.
+#
+# Verify:  systemctl status macpro-fand
+#          journalctl -u macpro-fand -o cat | tail -1
+
+[Unit]
+Description=Mac Pro 7,1 zone fan control and power budget
+Documentation=man:macpro-fand(8) man:macpro-fand.conf(5)
+Conflicts=t2fanrd.service
+After=t2fanrd.service resize-amdgpu-bars.service
+# Never give up restarting: every failed run ends with the fans at their caps
+# (ExecStopPost). Exit status 78 means no Mac Pro 7,1 fan hardware: no restart.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/sbin/macpro-fand
+ExecStopPost=/usr/sbin/macpro-fand --stopped
+WatchdogSec=20
+Restart=always
+RestartSec=2
+RestartPreventExitStatus=78
+TimeoutStopSec=15
+# The start waits up to 240 s for applesmc and amdgpu (amdgpu binds late in
+# boot when resize-amdgpu-bars loads it).
+TimeoutStartSec=300
+RuntimeDirectory=macpro-fand
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

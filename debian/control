@@ -1,0 +1,25 @@
+Source: macpro-fand
+Section: admin
+Priority: optional
+Maintainer: Exabit Networks <packages@exabit.io>
+Build-Depends: debhelper-compat (= 13), python3, scdoc
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: macpro-fand
+Architecture: all
+Depends: ${misc:Depends}, python3 (>= 3.8), systemd
+Suggests: t2fanrd, resize-amdgpu-bars
+Description: Zone fan control and 1228 W power budget for the Mac Pro 7,1
+ Runs the four fans of a Mac Pro 7,1 (2019) through the T2 applesmc driver as
+ four independent zones (MPX bay 1, MPX bay 2, CPU, memory side), each fan
+ held by its own governor at the temperatures where the whole machine draws
+ the least power, with hysteresis. Any alarm sends every fan to full speed.
+ .
+ Also keeps the machine under the 1228 W DC envelope of its power supply by
+ managing the power caps of the GPU dies (amdgpu) and the CPU's RAPL limits:
+ the worst case of every limit together never exceeds the budget, and power
+ moves to whichever consumer needs it, CPU first. Each GPU die's cap also
+ follows its temperature, holding it at a working temperature that limits
+ leakage. Replaces t2fanrd as the fan owner; a clean stop hands the fans back
+ to t2fanrd.
