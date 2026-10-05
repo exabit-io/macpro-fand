@@ -94,8 +94,9 @@ budget charges it for. Every uncapped device found at start that the
 calibration did not include (Mellanox network cards, NVMe drives other than the
 internal flash, rotational disks) adds its worst case to BASE.
 
-Within the budget, power moves by demand, CPU first. A consumer drawing at
-least 93 % of its limit is saturated. A saturated CPU gets at least its default
+Within the budget, power moves by demand, CPU first. A GPU die drawing at
+least 93 % of its cap is saturated, and so is the CPU at 85 % of PL1 (with PL2
+held at PL1, RAPL keeps the package near 90 % of it). A saturated CPU gets at least its default
 share at once, taken from free budget first, then from idle dies, then evenly
 from every die. Saturated dies get free budget, the budget of idle sibling
 dies, and only the part of the CPU's limit that the CPU does not use (it keeps

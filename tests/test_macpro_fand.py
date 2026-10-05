@@ -82,11 +82,12 @@ def test_budget(m):
         check(b.gpu["1e:00.0"] < min(b.gpu[a] for a in DIES[:3]) - 5,
               f"base {box.m._BASE:.0f}: the hotter die runs at a lower cap ({[round(v) for v in b.gpu.values()]})")
         box.run(120, 300, 280)
-        cpu_took = b.pl1 >= min(p0 + 1, m.CPU_PL1["max"]) or b.pl1 >= 0.95 * 280 / m.SAT
+        cpu_took = b.pl1 >= min(p0 + 1, m.CPU_PL1["max"]) or b.pl1 >= 0.95 * 280 / m.SAT_CPU
         check(cpu_took and all(b.gpu[a] <= g0[a] + 1 for a in DIES),
               f"base {box.m._BASE:.0f}: CPU first: PL1 {p0:.0f} -> {b.pl1:.0f} W, no die gained "
               f"({[round(v) for v in g0.values()]} -> {[round(v) for v in b.gpu.values()]})")
-        check(b.pl1 >= 280 * m.SAT - 1, f"base {box.m._BASE:.0f}: a CPU drawing 280 W is not starved (PL1 {b.pl1:.0f})")
+        check(b.pl1 >= 280 * m.SAT_CPU - 1,
+              f"base {box.m._BASE:.0f}: a CPU drawing 280 W is not starved (PL1 {b.pl1:.0f})")
         g1 = dict(b.gpu)
         box.run(300, 300, 150)
         at_ceiling = all(b.gpu[a] >= b.tcap[a] - 1 for a in DIES)
@@ -97,6 +98,20 @@ def test_budget(m):
         box.run(300, 20, 150)
         check(box.worst <= b.limit + 1e-6, f"base {box.m._BASE:.0f}: worst cost {box.worst:.1f} <= {b.limit}")
         check(box.jmax < m.T_WORK[0] + 8, f"base {box.m._BASE:.0f}: hottest junction {box.jmax:.1f} C")
+
+
+def test_rapl_regulated_cpu(m):
+    """With PL2 held at PL1, RAPL keeps the package near 90 % of PL1: that must count as saturated."""
+    m._BASE = m.BASE
+    b = m.Budget({a: "/nonexistent" for a in DIES}, True)
+    b.limit = 900.0
+    b.reset()
+    for t in range(4, 40, 4):                       # dies saturated, CPU idle: the dies borrow
+        b.rebalance(float(t), {a: 0.97 * b.gpu[a] for a in DIES}, 30.0)
+    p0 = b.pl1
+    msg = b.rebalance(44.0, {a: 0.97 * b.gpu[a] for a in DIES}, 0.90 * b.pl1)
+    check(msg is not None and "cpu wants" in msg and b.pl1 > p0,
+          f"a CPU held at 90 % of PL1 by RAPL counts as saturated (PL1 {p0:.0f} -> {b.pl1:.0f}: {msg})")
 
 
 def test_pins_backstop(m):
@@ -152,6 +167,7 @@ def main():
     test_level(m)
     test_cpu_target(m)
     test_budget(m)
+    test_rapl_regulated_cpu(load())
     test_pins_backstop(load())
     test_config(load())
     print(f"\n{'FAILED: ' + str(len(failures)) if failures else 'all checks passed'}")

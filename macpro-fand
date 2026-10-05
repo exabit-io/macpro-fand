@@ -19,17 +19,18 @@ block for good behind a stuck driver operation. The control loop only ever touch
 older than GPU_STALE raises an alarm.
 
 Power budget: the box must never draw more than the SMC's 1228 W DC envelope (crossing it latches the Vega 20 dies
-at 1000 MHz until a cold power cycle). Power caps are kept independent of temperature: whatever
-spikes at once, the sum of every consumer's worst case at its current limit stays under the budget,
+at 1000 MHz until a cold power cycle). Power caps are kept independent of temperature: whatever spikes at once, the
+sum of every consumer's worst case at its current limit stays under the budget,
   BASE + K_GPU * sum(die caps) + K_CPU * PL1  <=  LIMIT - MARGIN,
-and the budget moves by demand, CPU first (everything in the box depends on the CPU). A CPU drawing >= 93 % of PL1 gets at least its default share at once, funded from free budget, idle dies,
-then every die evenly (a little off each of four); dies drawing >= 93 % of their cap get free budget, idle siblings'
-budget and only what the CPU does not use; whatever the dies do not hold is the CPU's. Within the budget each die's cap
-follows its temperature (full auto): over its working temperature T_WORK its ceiling comes down, below it the ceiling
-goes back up slowly. Lowering writes finish before any raising write. PL2 is held at PL1, so the CPU cannot burst
-past what the budget charges it for. BASE grows by a worst case for every uncapped device found at
-start beyond the calibrated box (NICs, NVMe drives, hard disks). Backstop: measured DC over BACKSTOP on two samples in
-a row -> every limit to its floor for 60 s. On stop or crash the limits go to STATIC_SAFE.
+and the budget moves by demand, CPU first (everything in the box depends on the CPU). A CPU drawing >= 85 % of PL1
+gets at least its default share at once, funded from free budget, idle dies, then every die evenly (a little off
+each of four); dies drawing >= 93 % of their cap get free budget, idle siblings' budget and only what the CPU does
+not use; whatever the dies do not hold is the CPU's. Within the budget each die's cap follows its temperature (full
+auto): over its working temperature T_WORK its ceiling comes down, below it the ceiling goes back up slowly.
+Lowering writes finish before any raising write. PL2 is held at PL1, so the CPU cannot burst past what the budget
+charges it for. BASE grows by a worst case for every uncapped device found at start beyond the calibrated box (NICs,
+NVMe drives, hard disks). Backstop: measured DC over BACKSTOP on two samples in a row -> every limit to its floor
+for 60 s. On stop or crash the limits go to STATIC_SAFE.
 
 Read-only towards amdgpu except the power caps. Run as root, normally as macpro-fand.service (Conflicts=t2fanrd).
 Settings: /etc/macpro-fand.conf (see macpro-fand.conf(5)); usage: macpro-fand(8).
@@ -68,7 +69,8 @@ PERIOD = 2.0                          # loop period, s
 # applesmc numbering: fan1 = SMC F0 = rear blower (memory side, 500-1200 rpm); fan2..fan4 = F1..F3 = front axials
 # (500-2500 rpm), bottom to top. Zone test, one fan raised at a time at thermal equilibrium, C per 100 rpm:
 #   fan2 bottom: MPX bay 1 dies -0.66/-0.72, PCH -0.44          fan3 middle: MPX bay 2 dies -0.33/-0.34
-#   fan4 top: CPU heatsink -0.12, package -0.14, DIMMs -0.10     blower: DIMMs -0.24, flash -0.20, PSU -0.6, CPU hs -0.19
+#   fan4 top: CPU heatsink -0.12, package -0.14, DIMMs -0.10
+#   blower: DIMMs -0.24, flash -0.20, PSU -0.6, CPU heatsink -0.19
 BLOWER, BOT, MID, TOP = 1, 2, 3, 4
 FRONT = (BOT, MID, TOP)
 MIN_RPM = {BLOWER: 500, BOT: 500, MID: 500, TOP: 500}
@@ -116,7 +118,7 @@ EMERG_MARGIN = 5.0     # a raw reading within this of crit sends every fan to it
 # Power budget. K_GPU / K_CPU / BASE: DC W per die W, per CPU package W, and the idle box with every fan at full
 # speed plus an allowance for memory/IO load -- from a calibration run on a Mac Pro 7,1 (W-3275M, 2x Vega II Duo).
 BUDGET_LIMIT = 1228.0      # SMC DC envelope, W
-BUDGET_MARGIN = 80.0       # kept free: model error, AC-side events (a clamp once followed an AC spike without a DC breach)
+BUDGET_MARGIN = 80.0       # kept free: model error, AC-side events (a clamp once followed an AC spike, no DC breach)
 # Calibration (fans at full speed, 14 steps, each at equilibrium): DC = 66.9 + 1.205 * dies +
 # 1.156 * package, rms 3.9 W, max 8 W (GPUs 85-200 W, CPU 100-268 W, combined up to 975 W predicted / 975 W measured).
 # BASE adds 60 W for memory/flash traffic the model does not see (DIMM saturation + flash reads measured +45 W).
@@ -150,6 +152,7 @@ CPU_KEEP = (1.2, 20.0)     # a CPU under SAT keeps use * 1.2 + 20 W of PL1; the 
 DEVICE_W = {"mellanox": 25.0, "nvme": 9.0, "disk": 25.0}
 BUDGET_PERIOD = 4.0        # s between reallocations
 SAT, IDLE = 0.93, 0.60     # a consumer drawing >= SAT of its limit wants more; <= IDLE of it can give
+SAT_CPU = 0.85             # the CPU's SAT: with PL2 held at PL1, RAPL keeps the package at ~90 % of PL1 (112 W at 124)
 STEP_FRAC = 0.20           # each move: at least this fraction of the current limit (GPU >= 5 W, CPU >= 10 W)
 BACKSTOP, BACKSTOP_N, BACKSTOP_HOLD = 1190.0, 2, 60.0  # measured DC W, consecutive samples, s at the floors
 RAPL_PL1 = "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"
@@ -170,7 +173,7 @@ SMC = {
     **{f"TM{i}P": (BLOWER, 50.0, 85.0, 1.0) for i in range(9)},      # DIMM proximity
     **{f"Tp{i}P": (BLOWER, 55.0, 80.0, 1.0) for i in range(3)},      # power supply
 }
-NVME = (BLOWER, 55.0, 1.0)             # internal flash (hwmon "nvme"): zone fan, target, band; emergency = crit - margin
+NVME = (BLOWER, 55.0, 1.0)   # internal flash (hwmon "nvme"): zone fan, target, band; emergency = crit - margin
 # Production devices' temperatures (health targets; emergency = crit - margin, or the default crit): zone fan by PCI
 # slot -- slots 5-8 sit behind the middle front fan. The AUX-bay disks' fan is not measured yet: MID until a zone test
 # places them.
@@ -231,7 +234,8 @@ def pci_vendor(addr):
 
 def pci_chain(path):
     """PCI addresses (domain:bus:dev.fn) along a sysfs device path, root first."""
-    return [c for c in os.path.realpath(path).split("/") if len(c) == 12 and c[4] == ":" and c[7] == ":" and c[10] == "."]
+    return [c for c in os.path.realpath(path).split("/")
+            if len(c) == 12 and c[4] == ":" and c[7] == ":" and c[10] == "."]
 
 
 def pci_slot(path):
@@ -261,7 +265,8 @@ def devices():
     """Uncapped devices beyond the calibrated box: {'mellanox': cards, 'nvme': drives, 'disk': rotational disks}."""
     mlx = {a[:-2] for a in (os.path.basename(d) for d in glob.glob("/sys/bus/pci/devices/*"))
            if pci_vendor(a) == "0x15b3" and not os.path.exists(f"/sys/bus/pci/devices/{a}/physfn")}
-    nvme = [n for n in glob.glob("/sys/class/nvme/nvme*") if pci_vendor((pci_chain(n + "/device") or ["?"])[-1]) != "0x106b"]
+    nvme = [n for n in glob.glob("/sys/class/nvme/nvme*")
+            if pci_vendor((pci_chain(n + "/device") or ["?"])[-1]) != "0x106b"]
     disk = [b for b in glob.glob("/sys/block/sd*") if rds(b + "/queue/rotational") == "1"]
     return {"mellanox": len(mlx), "nvme": len(nvme), "disk": len(disk)}
 
@@ -282,7 +287,8 @@ def level(g, dies, amount, bound, down):
     caps get first, each stopping at its bound (a floor going down, a ceiling going up). Returns the W moved."""
     if not dies or amount <= 0:
         return 0.0
-    moved = lambda L: sum(max(0.0, g[a] - max(L, bound[a])) if down else max(0.0, min(L, bound[a]) - g[a]) for a in dies)
+    moved = lambda L: sum(max(0.0, g[a] - max(L, bound[a])) if down else max(0.0, min(L, bound[a]) - g[a])
+                          for a in dies)
     lo, hi = (min(bound[a] for a in dies), max(g[a] for a in dies)) if down else \
              (min(g[a] for a in dies), max(bound[a] for a in dies))
     if moved(lo if down else hi) <= amount:
@@ -350,6 +356,12 @@ CHILD_ENV = {k: v for k, v in os.environ.items() if k != "NOTIFY_SOCKET"}   # ch
 
 def systemctl(*a, **kw):
     return subprocess.run(["systemctl", *a], env=CHILD_ENV, timeout=10, **kw)
+
+
+def under_systemd():
+    """Running as a service's main process (systemd's child), not merely beside one (INVOCATION_ID is inherited by
+    anything a unit starts)."""
+    return "INVOCATION_ID" in os.environ and os.getppid() == 1
 
 
 def unit_active(unit):
@@ -644,7 +656,8 @@ class Budget:
     def thermal(self, dies, fan_full, dt):
         """Working-temperature ceilings: over T_WORK (or HBM_WORK) + band a die's ceiling comes down from its present
         draw -- once its bay fan is at full speed, or at once CAP_EARLY over; under - band it goes back up slowly
-        (to at most CAP_LEAD over the allocation); inside the band it holds. dies: {addr: (junction C, HBM C, W, bay)}."""
+        (to at most CAP_LEAD over the allocation); inside the band it holds.
+        dies: {addr: (junction C, HBM C, W, bay)}."""
         for a, (tj, tm, w, bay) in dies.items():
             if tj is None or a not in self.tcap:
                 continue
@@ -695,7 +708,7 @@ class Budget:
         pl1 = self.pl1
         free = lambda: self.limit - self.cost(g, pl1)
         idle = [a for a in g if die_w.get(a) is not None and die_w[a] <= IDLE * g[a] and g[a] > lo]
-        cpu_sat = cpu_w is not None and cpu_w >= SAT * pl1 and pl1 < CPU_PL1["max"]
+        cpu_sat = cpu_w is not None and cpu_w >= SAT_CPU * pl1 and pl1 < CPU_PL1["max"]
         if cpu_sat:
             dflt = max(CPU_PL1["floor"], self.room({a: float(GPU_CAP["init"]) for a in g}))
             target = min(CPU_PL1["max"], max(dflt, pl1 + max(10.0, STEP_FRAC * pl1)))
@@ -739,7 +752,7 @@ def parse_override():
     except ValueError:
         pin = None
     try:
-        ppin = min(max(float(ppin[0][4:]), 10.0), CPU_PL1["max"]) if ppin else None   # experiments may go under the floor
+        ppin = min(max(float(ppin[0][4:]), 10.0), CPU_PL1["max"]) if ppin else None   # may go under the floor
     except ValueError:
         ppin = None
     pin = (pin, ppin) if (pin is not None or ppin is not None) else None
@@ -916,7 +929,7 @@ def main():
 
     # Exclusive ownership. Under systemd, Conflicts=/After= stop t2fanrd before we start; by hand, refuse.
     if not args.dry_run:
-        end = time.monotonic() + (15 if "INVOCATION_ID" in os.environ else 0)
+        end = time.monotonic() + (15 if under_systemd() else 0)
         while unit_active("t2fanrd.service") and time.monotonic() < end:
             time.sleep(0.5)
         if unit_active("t2fanrd.service"):
@@ -1077,7 +1090,8 @@ def main():
                 if ref[f][0] is None or abs(written[f] - ref[f][0]) > 100:
                     ref[f] = (written[f], now)
                 off = tach is None or abs(tach - written[f]) > max(FAN_TOL[0], FAN_TOL[1] * written[f])
-                if off and (failed[f] or now - ref[f][1] > FAN_SETTLE):
+                stopped = tach is None or tach < 0.5 * MIN_RPM[f]   # a stopped fan counts at once, ramp or not
+                if off and (failed[f] or stopped or now - ref[f][1] > FAN_SETTLE):
                     good_since[f] = None
                     bad_since[f] = bad_since[f] or now
                     if now - bad_since[f] > FAN_FAIL:
@@ -1139,7 +1153,7 @@ def main():
                     tach={f: fan_in[f].raw for f in CAP})
     finally:
         # Under systemd, ExecStopPost decides; run by hand, cap first and hand back to t2fanrd.
-        if not args.dry_run and "INVOCATION_ID" not in os.environ:
+        if not args.dry_run and not under_systemd():
             write_static_safe()
             handback()
 
