@@ -16,8 +16,9 @@ check-version:
 	   echo "debian/rules: $(SCRIPT) says VERSION=$$sv but debian/changelog says $$cv" >&2; exit 1; \
 	 fi; echo "debian/rules: script version $$sv matches changelog"
 
+# '\" t on the first line makes man(1) run tbl for the zone table.
 man/%: man/%.scd
-	scdoc < $< > $@
+	{ printf "'\\\\\" t\n"; scdoc < $<; } > $@
 
 override_dh_auto_build: check-version $(MANPAGES)
 
@@ -44,3 +45,7 @@ override_dh_auto_install:
 # pending) and every fan sits at its cap for the few seconds between the two runs.
 override_dh_installsystemd:
 	dh_installsystemd
+
+# xz rather than zstd: debsigs signs xz members (and older dpkg reads them).
+override_dh_builddeb:
+	dh_builddeb -- -Zxz

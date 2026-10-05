@@ -126,8 +126,11 @@ GPU_CAP = {"floor": 85, "max": 200, "init": 125}       # W per die; caps <= 85 W
 # while they can; once a die passes its working temperature (far above 100 F: its bay fan is at full speed by then) its
 # ceiling comes down until it holds there, and goes back up slowly once it is cooler. Hot dies leak, and LLM decode is
 # HBM-bandwidth-bound, so watts above the working temperature buy little. The budget allocates within these ceilings.
-# T_WORK is a stand-in (about what 125 W reaches at full airflow) until the GPU load sweep measures the leakage cost.
-T_WORK = (60.0, 1.0)       # die junction C, band
+# T_WORK from the GPU load sweep (four dies at 125 W, both bay fans stepped down and back up, every point at
+# equilibrium): total DC is lowest at 1750-2000 rpm with the junctions at 65-67 C; hotter, throughput falls 0.05 % per
+# C at a fixed cap and the MPX rails outside the capped dies draw more (+8.4 W at 1250 rpm, 81 C), and below 1500 rpm
+# the heat removal collapses. 65 C = the junction at that optimum.
+T_WORK = (65.0, 1.0)       # die junction C, band
 HBM_WORK = 80.0            # hottest HBM stack, C (same band)
 CAP_DOWN = (1.0, 10.0)     # ceiling W/s per C over the band, max W/s (from the die's present draw: acts at once)
 CAP_UP = (0.1, 1.0)        # ceiling W/s per C under the band, max W/s

@@ -108,7 +108,7 @@ the middle front fan (MPX bay 2 and PCIe slots 5-8), *4* the top front fan
 
 # GPU WORKING TEMPERATURE
 
-*T_WORK* = _(60.0, 1.0)_
+*T_WORK* = _(65.0, 1.0)_
 	Working junction temperature and band, °C. Over it, with the bay fan at
 	full speed, a die's cap comes down until the die holds there.
 
@@ -127,7 +127,7 @@ the middle front fan (MPX bay 2 and PCIe slots 5-8), *4* the top front fan
 # EXAMPLE
 
 	# a warmer working temperature, and a slower CPU fan at idle
-	T_WORK = (65.0, 1.0)
+	T_WORK = (68.0, 1.0)
 	ZONES = {4: {"floor": 600}}
 
 # SEE ALSO
