@@ -1,6 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: macpro-fand
 Upstream-Contact: Exabit Networks <packages@exabit.io>
+Source: https://github.com/exabit-io/macpro-fand
 
 Files: *
 Copyright: 2026 Exabit, Inc.

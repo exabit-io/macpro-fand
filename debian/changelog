@@ -1,3 +1,120 @@
+macpro-fand (1.0.6) unstable; urgency=low
+
+  * Documentation only (fifth external review of 1.0.5, which was not
+    released): the 10 W staging step for an unreadable limit is the one
+    bounded exception to "no step costs more than the larger of the state
+    before and the target" -- at most 59.76 W of model with the default
+    four-die calibration, inside the default 80 W margin; a custom margin,
+    coefficients or topology need their own check. The daemon's code is
+    unchanged from 1.0.5.
+
+ -- Exabit Networks <packages@exabit.io>  Tue, 06 Oct 2026 08:30:09 +0000
+
+macpro-fand (1.0.5) unstable; urgency=medium
+
+  * Fixes from a fourth external review of 1.0.4 (1.0.4 was not released).
+  * The budget's feasibility is judged on every loop with the CPU's present
+    charge, not once at start: an allocation that stops fitting (RAPL no
+    longer enforcing, PL2 not held) raises an alarm -- every fan at its cap
+    -- for as long as it lasts, while the power worker only lowers limits;
+    the state log reports "feasible" separately from "confirmed".
+  * STATIC_SAFE limits must be whole watts too.
+  * Tests: the --check-config subprocess runs on the inventory fixture.
+
+ -- Exabit Networks <packages@exabit.io>  Tue, 06 Oct 2026 07:25:18 +0000
+
+macpro-fand (1.0.4) unstable; urgency=high
+
+  * Fixes from a third external review of 1.0.3 (1.0.3 was not released).
+  * A power limit whose value cannot be read is first set to 10 W, the
+    lowest value ever written, instead of its configured floor: with raised
+    floors and older caps (or a CPU pin) below them, the floor could be an
+    increase made before headroom existed.
+  * An allocation that does not fit the budget only lowers limits, in normal
+    operation and in the stop hook (a static-safe plan that cannot fit no
+    longer raises a low CPU pin); the stop then reports incomplete recovery.
+  * Every power-limit reading carries the time it was actually read: an old
+    PL2 reading is no longer made fresh by a slow transaction.
+  * On stop, every fan goes to full speed before the wait for the power
+    worker.
+  * A binary override file is ignored instead of restarting the daemon;
+    PERIPH keys must be driver names; power limits in the configuration
+    must be whole watts.
+  * Tests: the host inventory is a fixture (both suites pass on a builder
+    with no GPU), crashes count as named failures, and mutation_check.py
+    requires a passing baseline and the failing check of each defect's own
+    finding.
+
+ -- Exabit Networks <packages@exabit.io>  Tue, 06 Oct 2026 06:15:43 +0000
+
+macpro-fand (1.0.3) unstable; urgency=high
+
+  * Fixes from a second external review of 1.0.2 (1.0.2 was not released).
+  * Power transactions: a limit whose value cannot be read goes to its floor
+    before anything is raised; nothing goes up until every limit is
+    confirmed. A limit counts as set only at or up to 1 W below its target,
+    never above; limits are written in whole watts rounded down, never below
+    10 W (amdgpu takes 0 as "restore the default").
+  * The CPU's charge for an unheld PL2 or RAPL not enforcing applies to
+    override pins, the reset after a pin and the stop hook; an unheld PL2 is
+    read every cycle and a stale reading counts as 413 W.
+  * Stop: the power worker starts nothing more and the operation in progress
+    is waited for before the static-safe limits are written; with an
+    operation stuck in the driver no competing transaction is started (fans
+    at their caps, exit status 1). No bounded operation starts after its
+    deadline.
+  * The stop hook takes the owner lock and leaves another running
+    macpro-fand alone; it recovers with the built-in defaults whatever the
+    configuration file holds (no parse or validation error can stop it).
+  * Configuration: GPU_CAP floor <= init, STATIC_SAFE no lower than the
+    floors, PL1 floor >= 10 W; unhashable or oversized values are errors.
+  * GPU read-failure alarms persist until a good reading; GPU filters use
+    the time between samples. SMC key lookups that failed are retried.
+    GPU dies that are not Vega 20 are logged as unsupported.
+  * Lock files are checked against the running user: both test suites run
+    as an ordinary user (Rules-Requires-Root: no).
+
+ -- Exabit Networks <packages@exabit.io>  Tue, 06 Oct 2026 04:32:09 +0000
+
+macpro-fand (1.0.2) unstable; urgency=high
+
+  * Power limits: one worker thread owns every power-limit read and write,
+    so a blocked amdgpu call never stalls the fan loop. Each change is a
+    transaction (confirmed decreases, then unreadable limits, then
+    increases), every write is read back, and the first failure stops the
+    transaction: nothing is raised on budget that was not released. The
+    limits are re-read every 2 s and restored or retried until they read
+    back; a stuck or unconfirmed limit is an alarm.
+  * The stop hook writes the static-safe limits by the same rule, every
+    read and write bounded, 10 s for the whole.
+  * Accounting: a die without a manageable power cap is charged 200 W, in
+    the budget and in the static-safe limits; the CPU is charged at PL2 as
+    read back when PL2 cannot be held at PL1, and at 413 W while RAPL does
+    not enforce.
+  * An override pin that ends during the 60 s backstop hold waits for it.
+    Without a measured DC reading for 15 s the allocation is held.
+  * Configuration: the whole file is validated (types, shapes, ranges,
+    finite numbers, floors that fit the budget) before anything is used; an
+    invalid file is reported and the daemon exits 78 with nothing applied.
+    New option --check-config. A lower GPU_CAP maximum also bounds the
+    start allocation and the static-safe caps.
+  * Locks: /run/macpro-fand/owner.lock makes the process that owns the
+    hardware exclusive (a second instance refuses); the SMC lock moves to
+    /run/macpro-fand/smc.lock, root-only (0600), never opened through a
+    symlink, and waited for with a bound.
+  * GPU readings carry their own read time per die. A die at its
+    emergency temperature alarms even when its power cannot be read. A
+    failed RAPL read no longer crashes the loop, and a wrapped energy
+    counter is unwrapped. Non-finite sensor and override values are
+    rejected.
+  * Cleanup covers every hardware write from the first one; --dry-run
+    loads no kernel module; contradictory modes are refused.
+  * New failure-path test suite (tests/test_safety.py), run at build time.
+  * Documentation: the override example pins 110 W, within the installed
+    125 W ceiling (a pin above the configured maximum is lowered to it).
+
+ -- Exabit Networks <packages@exabit.io>  Tue, 06 Oct 2026 03:29:00 +0000
+
 macpro-fand (1.0.1) unstable; urgency=medium
 
   * The installed /etc/macpro-fand.conf sets GPU_CAP = {"max": 125}: GPU

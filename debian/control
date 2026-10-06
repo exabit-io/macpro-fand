@@ -5,6 +5,9 @@ Maintainer: Exabit Networks <packages@exabit.io>
 Build-Depends: debhelper-compat (= 13), python3, scdoc
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
+Homepage: https://github.com/exabit-io/macpro-fand
+Vcs-Browser: https://github.com/exabit-io/macpro-fand
+Vcs-Git: https://github.com/exabit-io/macpro-fand.git
 
 Package: macpro-fand
 Architecture: all

@@ -50,16 +50,18 @@ import argparse
 import fcntl
 import glob
 import json
+import math
 import os
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
 import threading
 import time
 
-VERSION = "1.0.1"
+VERSION = "1.0.6"
 CONFIG = "/etc/macpro-fand.conf"
 EX_NOHW = 78           # no Mac Pro 7,1 fan hardware: systemd does not restart (RestartPreventExitStatus=78)
 
@@ -160,6 +162,24 @@ STEP_FRAC = 0.20           # each move: at least this fraction of the current li
 BACKSTOP, BACKSTOP_N, BACKSTOP_HOLD = 1190.0, 2, 60.0  # measured DC W, consecutive samples, s at the floors
 RAPL_PL1 = "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"
 RAPL_PL2 = "/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw"   # short term (2 ms): held at PL1
+RAPL_ZONE = "/sys/class/powercap/intel-rapl:0"
+GPU_HW_MAX = 200.0         # W: Vega 20's own power1_cap_max; a die whose cap cannot be managed is charged this
+CPU_HW_MAX = 413.0         # W: the package's PL2 maximum here; the CPU is charged this while RAPL does not enforce
+POWER_TOL = 1e6            # uW: a limit reading back up to 1 W BELOW its target counts as set (never one above it)
+LIMIT_MIN = 10.0           # W: no limit is ever written below this (amdgpu takes a 0 cap as "restore the default");
+                           # a limit whose value cannot be read is first set to it (see transact()). A limit somebody
+                           # else set below 10 W can rise to 10 W in that step: at most K_GPU x 10 W per die and K_CPU x
+                           # 10 W for the CPU (charged max(PL1, PL2)) -- 59.76 W with four dies and the default
+                           # calibration, inside the default 80 W margin (custom margins/coefficients: check again).
+PL2_FRESH = 10.0           # s: an unheld PL2 last read longer ago than this is charged as CPU_HW_MAX
+RECONCILE = 2.0            # s between the power worker's read-backs (and re-applies when the hardware differs)
+POWER_STUCK = 15.0         # s a power-limit read or write may stay outstanding before it raises an alarm
+POWER_FAILING = 30.0       # s the limits may stay unconfirmed (failed writes) before it raises an alarm
+STOP_DEADLINE = 10.0       # s for the stop hook's whole power transaction (TimeoutStopSec=15)
+DC_DEGRADED = 15.0         # s without a measured DC reading before the budget stops moving power around
+RUN_DIR = "/run/macpro-fand"
+OWNER_LOCK = RUN_DIR + "/owner.lock"   # held for the life of the controlling process (one hardware owner)
+SMC_LOCK = RUN_DIR + "/smc.lock"       # around every two-step SMC key read (shared with other root tools)
 RAPL_E = "/sys/class/powercap/intel-rapl:0/energy_uj"
 TEST_BUDGET = float(os.environ.get("MACPRO_FAND_TEST_BUDGET", "0") or 0)     # test hook: budget (limit - margin)
 TEST_BACKSTOP = float(os.environ.get("MACPRO_FAND_TEST_BACKSTOP", "0") or 0)
@@ -212,9 +232,10 @@ def rds(path):
 
 def rd(path, scale=1.0):
     try:
-        return float(rds(path)) / scale
+        v = float(rds(path))
     except (TypeError, ValueError):
         return None
+    return v / scale if math.isfinite(v) else None
 
 
 def wr(path, val):
@@ -264,6 +285,15 @@ def die_map():
     return out
 
 
+VEGA20 = {f"0x66a{i:x}" for i in range(16)}             # PCI device ids of Vega 20 (Radeon Pro Vega II, MI50/60)
+
+
+def gpu_model_ok(addr):
+    """True for a Vega 20 die: GPU_HW_MAX (200 W) and the calibration are Vega 20's."""
+    devs = glob.glob("/sys/bus/pci/devices/*:" + addr)
+    return bool(devs) and rds(devs[0] + "/device") in VEGA20
+
+
 def devices():
     """Uncapped devices beyond the calibrated box: {'mellanox': cards, 'nvme': drives, 'disk': rotational disks}."""
     mlx = {a[:-2] for a in (os.path.basename(d) for d in glob.glob("/sys/bus/pci/devices/*"))
@@ -311,6 +341,32 @@ def level(g, dies, amount, bound, down):
     return total
 
 
+def open_lock(path):
+    """A private lock file: created 0600 in RUN_DIR (root, 0755), never through a symlink, never truncated. Returns
+    an fd, or raises OSError if the file is not a regular file owned by this process's user (root for the daemon)."""
+    os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    st = os.fstat(fd)
+    if not (stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid()):
+        os.close(fd)
+        raise OSError(f"{path}: not a regular file owned by uid {os.geteuid()}")
+    os.fchmod(fd, 0o600)
+    return fd
+
+
+def flock_within(fd, seconds):
+    """Exclusive flock, polling for at most `seconds` (0: one try). True if held."""
+    end = time.monotonic() + seconds
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.01)
+
+
 def find_smc():
     cands = []
     for h in hwmon_named("applesmc"):
@@ -329,6 +385,17 @@ def cpu_target(w):
     if w is None or w <= w0:
         return t0
     return t1 if w >= w1 else t0 + (t1 - t0) * (w - w0) / (w1 - w0)
+
+
+def energy_rate(prev, now, e, emax):
+    """Package W between two RAPL energy readings: prev = [t, uJ]. None when either reading is missing; a counter
+    that wrapped is unwrapped with emax (max_energy_range_uj)."""
+    if e is None or prev[1] is None or prev[0] is None or now <= prev[0]:
+        return None
+    de = e - prev[1]
+    if de < 0 and emax:
+        de += emax
+    return de / 1e6 / (now - prev[0]) if de >= 0 else None
 
 
 def worst(vals):
@@ -428,7 +495,7 @@ class Filter:
         self.fails = 0
 
     def feed(self, v, dt):
-        if v is None:
+        if v is None or not math.isfinite(v):
             self.fails += 1
             return self.fails < READ_FAILS
         self.fails, self.raw = 0, v
@@ -469,192 +536,471 @@ class Die:
 
 
 class GpuReader(threading.Thread):
-    """Reads every die once per PERIOD; the control loop takes the latest snapshot and checks its age."""
+    """Reads every die once per PERIOD. Each die's reading carries the time its read STARTED and a sequence number,
+    so the control loop judges staleness per die (a slow scan cannot make old readings look fresh) and feeds each
+    reading to its filters once."""
 
     def __init__(self, dies):
         super().__init__(daemon=True, name="gpu-reader")
-        self.dies, self.lock, self.snap, self.t = dies, threading.Lock(), None, None
+        self.dies, self.lock, self.vals = dies, threading.Lock(), {}
         self.t0 = time.monotonic()
 
     def run(self):
+        seq = 0
         while True:
             if TEST_STALL_GPU and time.monotonic() - self.t0 > TEST_STALL_GPU:
                 threading.Event().wait()          # test hook: behave like a read stuck in the driver
-            vals = {d.addr: d.read() for d in self.dies}
-            with self.lock:
-                self.snap, self.t = vals, time.monotonic()
+            for d in self.dies:
+                t = time.monotonic()
+                v = d.read()
+                seq += 1
+                with self.lock:
+                    self.vals[d.addr] = (v, t, seq)
             time.sleep(PERIOD)
 
     def latest(self):
+        """{addr: (values, age s, seq)} for every die read so far."""
         with self.lock:
-            return self.snap, (None if self.t is None else time.monotonic() - self.t)
+            now = time.monotonic()
+            return {a: (v, now - t, q) for a, (v, t, q) in self.vals.items()}
 
 
 class SmcKey:
-    """One SMC key through applesmc-t2's two-step key_at_index interface, under LOCK, an flock that every tool reading
-    SMC keys this way should take (an interleaved reader gets another key's data). read() -> float or None, never
-    blocks for long."""
-    LOCK = "/run/lock/applesmc-keys.lock"
+    """One SMC key through applesmc-t2's two-step key_at_index interface (select an index, read name and data), under
+    SMC_LOCK, which every tool reading SMC keys this way should take: an interleaved reader gets another key's data.
+    Lock acquisition is bounded (2 s for the key lookup, 200 ms per read); read() -> float or None, never blocks for
+    long. A lookup that failed (lock busy, SMC not answering) is retried in the background every RETRY s."""
+    RETRY = 30.0
 
     def __init__(self, smc, key):
         self.smc, self.key, self.idx = smc, key, None
+        self.next_try, self.finder = 0.0, None
+        self._lookup()
+
+    def _lookup(self):
+        self.next_try = time.monotonic() + self.RETRY
         try:
-            n = int(rds(smc + "/key_count"))
-        except (TypeError, ValueError):
+            n = int(rds(self.smc + "/key_count"))
+            fd = open_lock(SMC_LOCK)
+        except (TypeError, ValueError, OSError):
             return
-        with open(self.LOCK, "w") as lk:
-            fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            if not flock_within(fd, 2.0):
+                return
             for i in range(n):
-                wr(smc + "/key_at_index", i)
-                if rds(smc + "/key_at_index_name") == key:
+                wr(self.smc + "/key_at_index", i)
+                if rds(self.smc + "/key_at_index_name") == self.key:
                     self.idx = i
                     break
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
 
     def read(self):
         if self.idx is None:
+            if time.monotonic() >= self.next_try and not (self.finder and self.finder.is_alive()):
+                self.next_try = time.monotonic() + self.RETRY
+                self.finder = threading.Thread(target=self._lookup, daemon=True, name="smc-lookup")
+                self.finder.start()
             return None
         try:
-            with open(self.LOCK, "w") as lk:
-                for _ in range(20):                   # up to ~200 ms for another reader to finish
-                    try:
-                        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except OSError:
-                        time.sleep(0.01)
-                else:
-                    return None
-                wr(self.smc + "/key_at_index", self.idx)
-                if rds(self.smc + "/key_at_index_name") != self.key:
-                    return None
-                data = open(self.smc + "/key_at_index_data", "rb").read()
-                return struct.unpack("<f", data[:4])[0] if len(data) >= 4 else None
+            fd = open_lock(SMC_LOCK)
         except OSError:
             return None
+        try:
+            if not flock_within(fd, 0.2):
+                return None
+            wr(self.smc + "/key_at_index", self.idx)
+            if rds(self.smc + "/key_at_index_name") != self.key:
+                return None
+            data = open(self.smc + "/key_at_index_data", "rb").read()
+            v = struct.unpack("<f", data[:4])[0] if len(data) >= 4 else None
+            return v if v is not None and math.isfinite(v) else None
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
 
 
-def write_async(path, value, deadline=10.0):
-    """Write in a background thread (amdgpu power-cap writes go to the SMU, which can hang); True if it completed."""
+def io_call(fn, end):
+    """Run fn() in a daemon thread, waiting until monotonic `end`: (True, result) if it finished, (False, None) if it
+    is still running (a driver call can block for good; the thread is left behind and nothing waits for it) or was
+    never started because `end` had already passed."""
+    if end - time.monotonic() <= 0:
+        return False, None
     res = []
-
-    def go():
-        try:
-            wr(path, value)
-            res.append(True)
-        except OSError:
-            res.append(False)
-    t = threading.Thread(target=go, daemon=True)
+    t = threading.Thread(target=lambda: res.append(fn()), daemon=True)
     t.start()
-    t.join(deadline)
-    return bool(res and res[0])
+    t.join(max(0.0, end - time.monotonic()))
+    return (True, res[0]) if res else (False, None)
+
+
+def write_uw(path, uw):
+    try:
+        wr(path, int(uw))
+        return True
+    except OSError:
+        return False
+
+
+def is_set(got, target):
+    """A limit counts as set when it reads back at its target or up to POWER_TOL below it -- never above it."""
+    return got is not None and target - POWER_TOL <= got <= target
+
+
+def pl_order(lst, pl2_first):
+    """PL2 right after PL1 (lowering) or right before it (raising), so PL2 >= PL1 throughout."""
+    lst = list(lst)
+    if RAPL_PL1 in lst and RAPL_PL2 in lst:
+        first, second = (RAPL_PL2, RAPL_PL1) if pl2_first else (RAPL_PL1, RAPL_PL2)
+        lst.remove(second)
+        lst.insert(lst.index(first) + 1, second)
+    return lst
+
+
+def transact(want, read, write, raise_ok=True):
+    """One power transaction in three phases, every write read back; the first write that fails, does not finish or
+    does not read back (is_set) stops it, so nothing after it is written:
+      1. limits known to be above their target come down (largest decrease first);
+      2. limits whose present value could not be read go to LIMIT_MIN, the lowest value ever written -- whatever the
+         configured floors are now or were before, so a limit of unknown value can only give headroom, never take it.
+         PL2 goes no lower than PL1 now is (the CPU is charged the larger of the two, so that cannot raise its charge);
+      3. with every limit confirmed at or below its target, the increases (PL2 before PL1) -- only if raise_ok: a plan
+         that does not fit the budget may only lower limits (the transaction then reports "infeasible").
+    No limit is raised while any limit is unknown, so no state on the way costs more than the larger of the state
+    before and the target -- with one bounded exception: a limit somebody else set below LIMIT_MIN rises to it in
+    phase 2 (at most 59.76 W of model with the default four-die calibration, inside the default 80 W margin; a custom
+    margin, coefficients or topology need their own check). A target that is not finite or below LIMIT_MIN refuses
+    the whole transaction before any write. read(p) -> uW or None; write(p, uW) -> bool. Returns (ok, failed path or None, {path: uW last read or None}).
+    """
+    bad = [p for p, v in want.items()
+           if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < LIMIT_MIN * 1e6]
+    if bad:
+        return False, bad[0], {}
+    cur = {p: read(p) for p in want}
+    seen = dict(cur)
+
+    def put(p, v):
+        if not write(p, v):
+            return False
+        seen[p] = cur[p] = read(p)
+        return is_set(cur[p], v)
+    for p in pl_order(sorted((p for p in want if cur[p] is not None and cur[p] > want[p]),
+                             key=lambda p: want[p] - cur[p]), False):
+        if not put(p, want[p]):
+            return False, p, seen
+    for p in pl_order([p for p in want if cur[p] is None], False):
+        v = LIMIT_MIN * 1e6
+        if p == RAPL_PL2 and cur.get(RAPL_PL1) is not None:
+            v = min(want[p], max(v, cur[RAPL_PL1]))
+        if not put(p, v):
+            return False, p, seen
+    up = pl_order([p for p in want if not is_set(cur[p], want[p])], True)
+    if up and not raise_ok:
+        return False, "infeasible", seen
+    for p in up:
+        if not put(p, want[p]):
+            return False, p, seen
+    return True, None, seen
+
+
+class _Superseded(Exception):
+    """A newer allocation, or a stop, arrived: the transaction in progress ends before its next operation."""
+
+
+class PowerWorker(threading.Thread):
+    """Owns every power-limit read and write (amdgpu power1_cap, RAPL PL1/PL2), so a stuck driver call stalls this
+    thread only, never the fan loop. Applies the newest desired allocation with transact(); every RECONCILE s it reads
+    the limits back and re-applies whenever the hardware differs, so a failed, unconfirmed or overwritten limit is
+    retried until it reads back. One operation at a time: an allocation that arrives mid-transaction supersedes it
+    before its next operation, and stop() ends all operations (the caller then owns the limits). Read-only paths in
+    `watch` are read every cycle, with the time of each read -- PL2 always, whenever PL1 is managed and PL2 is not
+    (an unheld PL2 is charged as it reads, so it must keep being read)."""
+    live = set()                              # running workers: write_static_safe() takes the limits from them first
+
+    def __init__(self):
+        super().__init__(daemon=True, name="power-worker")
+        self.cv = threading.Condition()
+        self.desired, self.gen, self.applied_gen = None, 0, -1
+        self.watch, self.raise_ok = set(), True
+        self.seen, self.seen_t = {}, {}       # path -> uW last read (None: unreadable), monotonic time of that read
+        self.ok, self.failed, self.fail_since = None, None, None
+        self.pending = None                   # (path, "read"|"write", since) while an operation is outstanding
+        self.halted = False                   # stop(): no operation is started any more
+        self.notes = []
+        self.pl2_bad = 0                      # consecutive transactions that failed on PL2
+
+    def set(self, want, watch=(), raise_ok=True):
+        """The desired limits; `raise_ok` False (the allocation does not fit the budget): only decreases are made."""
+        with self.cv:
+            if want != self.desired or set(watch) != self.watch or raise_ok != self.raise_ok:
+                self.desired, self.watch, self.raise_ok, self.gen = dict(want), set(watch), raise_ok, self.gen + 1
+                self.cv.notify_all()
+
+    def status(self):
+        with self.cv:
+            notes, self.notes = self.notes, []
+            return {"ok": self.ok, "failed": self.failed, "fail_since": self.fail_since, "pending": self.pending,
+                    "seen": dict(self.seen), "seen_t": dict(self.seen_t), "notes": notes, "pl2_bad": self.pl2_bad}
+
+    def stop(self, timeout):
+        """Start no further operation and wait (at most `timeout` s) for the one in progress. True: the worker is idle
+        for good and the caller owns the limits. False: an operation is still stuck in the driver -- the caller must
+        not start a competing transaction (it could be overtaken by the stuck write)."""
+        with self.cv:
+            self.halted = True
+            self.cv.notify_all()
+            return self.cv.wait_for(lambda: self.pending is None, timeout)
+
+    def _op(self, p, kind, gen, fn):
+        with self.cv:                         # checked and marked under the lock: stop() cannot slip in between
+            if self.halted or self.gen != gen:
+                raise _Superseded
+            self.pending = (p, kind, time.monotonic())
+        try:
+            return fn()
+        finally:
+            with self.cv:
+                self.pending = None
+                self.cv.notify_all()
+
+    def run(self):
+        PowerWorker.live.add(self)
+        try:
+            self._run()
+        finally:
+            PowerWorker.live.discard(self)
+
+    def _run(self):
+        while True:
+            with self.cv:
+                if self.applied_gen == self.gen and not self.halted:
+                    self.cv.wait(timeout=RECONCILE)
+                if self.halted:
+                    return
+                want, gen, watch = (dict(self.desired) if self.desired else None), self.gen, set(self.watch)
+                raise_ok, before = self.raise_ok, dict(self.seen)
+            if want is None:
+                continue
+            if RAPL_PL1 in want and RAPL_PL2 not in want:
+                watch.add(RAPL_PL2)
+            found, obs, read_t = {}, {}, {}
+
+            def read(p):
+                v = self._op(p, "read", gen, lambda: rd(p))
+                read_t[p] = time.monotonic()          # each value carries the time it was actually read
+                found.setdefault(p, v)                # transact() reads every limit before writing any
+                return v
+            try:
+                ok, failed, seen = transact(want, read, lambda p, uw: self._op(p, "write", gen, lambda: write_uw(p, uw)),
+                                            raise_ok)
+                for p in watch - set(want):
+                    obs[p] = read(p)
+            except _Superseded:
+                continue
+            now = time.monotonic()
+            with self.cv:
+                if gen == self.applied_gen:           # nothing new was asked: a difference is someone else's write
+                    ext = [p for p in want if before.get(p) is not None and found.get(p) is not None
+                           and is_set(before[p], want[p]) and not is_set(found[p], want[p])]
+                    if ext:
+                        self.notes.append(f"limits changed by someone else, ours restored: {ext}")
+                for p, v in list(seen.items()) + list(obs.items()):
+                    if p in read_t:
+                        self.seen[p], self.seen_t[p] = v, read_t[p]
+                self.ok, self.failed, self.applied_gen = ok, failed, gen
+                self.fail_since = None if ok else (self.fail_since or now)
+                self.pl2_bad = self.pl2_bad + 1 if failed == RAPL_PL2 else 0
+
+
+def pl2_observed(st, now):
+    """PL2 (uW) as the power worker last read it, if that read is at most PL2_FRESH s old; otherwise None (an unheld
+    PL2 is then charged as CPU_HW_MAX)."""
+    t = st["seen_t"].get(RAPL_PL2) if st else None
+    return st["seen"].get(RAPL_PL2) if t is not None and now - t <= PL2_FRESH else None
+
+
+def rapl_state():
+    """(enforcing, pl2 present): the package zone is enabled and its constraints are long_term / short_term."""
+    enabled = rds(RAPL_ZONE + "/enabled") == "1"
+    names = (rds(RAPL_ZONE + "/constraint_0_name"), rds(RAPL_ZONE + "/constraint_1_name"))
+    return enabled and names[0] == "long_term", names[1] == "short_term"
 
 
 def budget_ready():
     return None not in (BASE, K_GPU, K_CPU)
 
 
-def static_safe():
-    """{'gpu': W per die, 'pl1': W}: the limits used when the daemon is not running (stop hook)."""
+def static_safe(n_managed=None, n_unmanaged=0, cpu_min=0.0):
+    """{'gpu': W per managed die, 'pl1': W, 'fits': bool}: the limits used when the daemon is not running (stop hook),
+    whole watts, for the dies actually present: unmanaged dies are charged GPU_HW_MAX, and the CPU max(PL1, cpu_min)
+    -- CPU_HW_MAX while RAPL does not enforce, PL2 as read when PL2 cannot be held at PL1. The managed dies come down
+    from STATIC_SAFE's cap (to their floor at the lowest) until the CPU's floor fits beside them."""
+    if n_managed is None:
+        n_managed = len(die_map())
     lim = BUDGET_LIMIT - BUDGET_MARGIN
-    g = STATIC_SAFE["gpu"]
-    pl1 = STATIC_SAFE["pl1"] or min(CPU_PL1["max"], (lim - base() - K_GPU * 4 * g) / K_CPU)
-    return {"gpu": g, "pl1": max(CPU_PL1["floor"], pl1)}
+    fixed = base() + K_GPU * GPU_HW_MAX * n_unmanaged
+    cost = lambda g, pl1: fixed + K_GPU * n_managed * g + K_CPU * max(pl1, cpu_min)
+    g = float(math.floor(min(STATIC_SAFE["gpu"], GPU_CAP["max"])))
+    while n_managed and cost(g, CPU_PL1["floor"]) > lim and g > GPU_CAP["floor"]:
+        g -= 1.0
+    pl1 = min(CPU_PL1["max"], (lim - fixed - K_GPU * n_managed * g) / K_CPU)
+    if STATIC_SAFE["pl1"] is not None:
+        pl1 = min(pl1, float(STATIC_SAFE["pl1"]))
+    pl1 = float(math.floor(max(CPU_PL1["floor"], pl1)))
+    return {"gpu": g, "pl1": pl1, "fits": cost(g, pl1) <= lim + 1e-6}
+
+
+def static_want(cap_paths, ss, pl2):
+    """The static-safe allocation as desired limits (uW); PL2 = PL1 when PL2 is managed."""
+    w = {p: ss["gpu"] * 1e6 for p in cap_paths}
+    w[RAPL_PL1] = ss["pl1"] * 1e6
+    if pl2:
+        w[RAPL_PL2] = w[RAPL_PL1]
+    return w
+
+
+def cap_paths_now():
+    """{die: power1_cap path} for every die of die_map() whose hwmon is present, and the dies without one."""
+    found, missing = {}, []
+    for a in die_map():
+        caps = glob.glob(f"/sys/bus/pci/devices/*:{a}/hwmon/hwmon*/power1_cap")
+        if caps:
+            found[a] = caps[0]
+        else:
+            missing.append(a)
+    return found, missing
 
 
 def write_static_safe():
-    """Stop hook: GPU caps and PL1 to their static-safe values (lowering writes first)."""
+    """Stop hook: GPU caps and PL1/PL2 to their static-safe values by the transaction rule (transact()), every read
+    and write bounded and none started after STOP_DEADLINE. The CPU is charged the same way as in normal operation:
+    CPU_HW_MAX while RAPL does not enforce or has no short-term limit; if PL2 cannot be set to PL1, PL2 as read back
+    (the dies come down for it). Operations that did not finish are logged. -> True when every limit is confirmed and
+    the allocation fits; None without a calibration."""
     if not budget_ready():
-        return
-    ss = static_safe()
-    caps = sorted(glob.glob("/sys/bus/pci/devices/*/hwmon/hwmon*/power1_cap"))
-    caps = [c for c in caps if any(a in c for a in die_map())]
-    order = [(RAPL_PL1, ss["pl1"])] + ([(RAPL_PL2, ss["pl1"])] if os.access(RAPL_PL2, os.W_OK) else []) + \
-        [(c, ss["gpu"]) for c in caps]
-    order.sort(key=lambda x: -((rd(x[0], 1e6) or 0) - x[1]))          # lowering writes (biggest decrease) first
-    for path, w in order:
-        ok = write_async(path, int(w * 1e6))
-        log(static_safe={path: [round(w), ok]})
+        return None
+    end = time.monotonic() + STOP_DEADLINE
+    for w in list(PowerWorker.live):                     # one writer: a live worker in this process stops first
+        if not w.stop(max(0.0, end - time.monotonic())):
+            log(static_safe={"ok": False, "failed": "power worker stuck", "pending": w.status()["pending"]})
+            return False
+    unresolved = []
+
+    def call(fn, what):
+        done, v = io_call(fn, end)
+        if not done:
+            unresolved.append(what)
+        return v if done else None
+    found, missing = call(cap_paths_now, "find power caps") or ({}, list(die_map()))
+    enforcing, pl2_present = call(rapl_state, "RAPL state") or (False, False)
+    pl2_present = pl2_present and os.path.exists(RAPL_PL2)
+    read = lambda p: call(lambda: rd(p), "read " + p)
+    write = lambda p, uw: bool(call(lambda: write_uw(p, uw), "write " + p))
+    cpu_min = 0.0 if enforcing and pl2_present else CPU_HW_MAX
+    ss = static_safe(len(found), len(missing), cpu_min)          # a plan that does not fit only lowers limits
+    ok, failed, seen = transact(static_want(found.values(), ss, pl2_present), read, write, ss["fits"])
+    if not ok and failed == RAPL_PL2:                    # PL2 will not follow PL1: charge it as it reads, without it
+        pl2 = seen.get(RAPL_PL2)
+        cpu_min = max(cpu_min, CPU_HW_MAX if pl2 is None else min(CPU_HW_MAX, pl2 / 1e6))
+        ss = static_safe(len(found), len(missing), cpu_min)
+        ok, failed, seen2 = transact(static_want(found.values(), ss, False), read, write, ss["fits"])
+        seen.update(seen2)
+    log(static_safe={"gpu": ss["gpu"], "pl1": ss["pl1"], "cpu_charged_w": max(ss["pl1"], cpu_min), "fits": ss["fits"],
+                     "ok": ok, "failed": failed, "unmanaged_dies": missing, "unresolved": unresolved,
+                     "read_back_w": {p: (None if v is None else round(v / 1e6, 1)) for p, v in seen.items()}})
+    return bool(ok and ss["fits"])
 
 
 class Budget:
-    """The 1228 W invariant over the GPU die caps and the CPU's PL1 (see the module docstring)."""
+    """The 1228 W invariant over the GPU die caps and the CPU's PL1 (see the module docstring). The planner only:
+    PowerWorker writes the limits. Charged at their worst case: a die whose cap cannot be managed (GPU_HW_MAX), the
+    CPU at the larger of PL1 and a PL2 that could not be held at PL1, and at CPU_HW_MAX while RAPL does not enforce."""
 
-    def __init__(self, cap_paths, dry):
-        self.paths, self.dry = cap_paths, dry                 # {die addr: power1_cap path}
+    def __init__(self, cap_paths, n_unmanaged=0):
+        self.paths = cap_paths                                # {die addr: power1_cap path}
+        self.n_unmanaged = n_unmanaged
         self.limit = TEST_BUDGET or (BUDGET_LIMIT - BUDGET_MARGIN)
         self.backstop = TEST_BACKSTOP or BACKSTOP
-        self.gpu = {a: float(GPU_CAP["init"]) for a in cap_paths}
+        self.gpu = {a: float(min(GPU_CAP["init"], GPU_CAP["max"])) for a in cap_paths}
         self.pl1 = float(CPU_PL1["max"])                      # fit() brings it down to what the invariant allows
-        self.pin = None                                       # W per die while an override pins the GPU caps
+        self.pin = None                                       # (GPU W or None, PL1 W or None) while pinned
+        self.reset_pending = False                            # a pin ended during the backstop hold
         self.tcap = {a: min(float(GPU_CAP["max"]), GPU_CAP["init"] + CAP_LEAD) for a in cap_paths}   # see thermal()
-        self.pl2 = os.access(RAPL_PL2, os.W_OK)              # held at PL1 where the firmware lets us write it
-        self.written = {}
-        self.over_n, self.floor_until, self.last, self.failed = 0, 0.0, 0.0, None
+        self.cpu_min = 0.0                                    # W the CPU is charged at least (unheld PL2, no RAPL)
+        self.pl2_held = True
+        self.degraded = False                                 # no measured DC: demand-driven moves pause
+        self.over_n, self.floor_until = 0, 0.0
         self.dc = None
         self.fit()
 
     def reset(self):
         """Back to the default allocation (GPUs at their init cap, PL1 as large as the invariant allows): at start and
         when an override pin ends (without demand the rebalancer would leave the pinned limits in place)."""
-        self.gpu = {a: float(GPU_CAP["init"]) for a in self.paths}
+        self.gpu = {a: float(min(GPU_CAP["init"], GPU_CAP["max"])) for a in self.paths}
         self.pl1 = float(CPU_PL1["max"])
         self.fit()
 
+    def fixed(self):
+        return base() + K_GPU * GPU_HW_MAX * self.n_unmanaged
+
     def cost(self, gpu=None, pl1=None):
         gpu = self.gpu if gpu is None else gpu
-        return base() + K_GPU * sum(gpu.values()) + K_CPU * (self.pl1 if pl1 is None else pl1)
+        return self.fixed() + K_GPU * sum(gpu.values()) + K_CPU * max(self.pl1 if pl1 is None else pl1, self.cpu_min)
+
+    def cpu_w(self):
+        """What the CPU is charged: PL1, or more while it can draw above PL1 (see cpu_charge())."""
+        return max(self.pl1, self.cpu_min)
 
     def room(self, gpu):
         """Largest PL1 the invariant allows beside these GPU caps (clipped to the CPU's range)."""
-        return min(CPU_PL1["max"], (self.limit - base() - K_GPU * sum(gpu.values())) / K_CPU)
+        return min(CPU_PL1["max"], (self.limit - self.fixed() - K_GPU * sum(gpu.values())) / K_CPU)
 
-    def fit(self):
-        """Make the current allocation satisfy the invariant: PL1 first down to its floor, then the GPUs evenly."""
-        self.pl1 = max(CPU_PL1["floor"], min(self.pl1, self.room(self.gpu)))
+    def fit(self, pl1_floor=None):
+        """Make the current allocation satisfy the invariant, the CPU charged max(PL1, cpu_min): PL1 first down to its
+        floor (or a pin's lower value), then the GPUs evenly. True if it fits; False if even every floor does not (the
+        caller alarms)."""
+        self.pl1 = max(CPU_PL1["floor"] if pl1_floor is None else pl1_floor, min(self.pl1, self.room(self.gpu)))
         while self.cost() > self.limit + 1e-6:
             hi = [a for a in self.gpu if self.gpu[a] > GPU_CAP["floor"]]
             if not hi:
-                break
+                return False
             for a in hi:
                 self.gpu[a] = max(GPU_CAP["floor"], self.gpu[a] - 1)
-
-    def apply(self):
-        """Lowering writes first; any failed lowering write blocks the raising ones (the invariant may not hold)."""
-        if self.dry:
-            return True
-        want = {p: int(self.gpu[a] * 1e6) for a, p in self.paths.items()}
-        want[RAPL_PL1] = int(self.pl1 * 1e6)
-        if self.pl2:
-            want[RAPL_PL2] = want[RAPL_PL1]
-        cur = {p: rd(p) for p in want}
-        down = [p for p in want if cur[p] is None or want[p] < cur[p] - 1e5]
-        up = [p for p in want if p not in down and abs(want[p] - (cur[p] or 0)) > 1e5]
-        up.sort(key=lambda p: p != RAPL_PL2)                  # PL2 never below PL1 on the way up
-        for p in down:
-            if not write_async(p, want[p]):
-                if p == RAPL_PL2:                            # firmware-locked PL2: PL1 alone, as before
-                    self.pl2 = False
-                    self.written.pop(p, None)
-                    log(budget_note="PL2 not writable: no longer held at PL1")
-                    continue
-                self.failed = p
-                return False
-            self.written[p] = want[p]
-        for p in up:
-            if write_async(p, want[p]):
-                self.written[p] = want[p]
-            elif p == RAPL_PL2:
-                self.pl2 = False
-                self.written.pop(p, None)
-                log(budget_note="PL2 not writable: no longer held at PL1")
-        for p in want:
-            if p != RAPL_PL2 or self.pl2:
-                self.written.setdefault(p, want[p])
-        self.failed = None
         return True
 
-    def external(self):
-        """Paths whose limit someone else changed since we wrote it."""
-        return [p for p, uw in self.written.items() if (rd(p) or 0) and abs(rd(p) - uw) > 1e6]
+    def cpu_charge(self, pl2_uw, enforcing):
+        """Charge the CPU for what it can actually draw, whatever PL1 is set to: PL2 as read back when PL2 is not held
+        at PL1, CPU_HW_MAX when RAPL does not enforce (or PL2 is neither held nor readable). The GPUs make room for it.
+        Returns True if the charge changed (the allocation was refitted)."""
+        if not enforcing or (not self.pl2_held and pl2_uw is None):
+            low = CPU_HW_MAX
+        elif not self.pl2_held:
+            low = min(CPU_HW_MAX, pl2_uw / 1e6)
+        else:
+            low = 0.0
+        if abs(low - self.cpu_min) < 0.5:
+            return False
+        self.cpu_min = low
+        self.fit()
+        return True
+
+    def want(self):
+        """The desired limits, uW, for PowerWorker: whole watts, rounded down, so the limits written never cost more than
+        the allocation the invariant was checked on."""
+        w = {p: math.floor(self.gpu[a]) * 1e6 for a, p in self.paths.items()}
+        w[RAPL_PL1] = math.floor(self.pl1) * 1e6
+        if self.pl2_held:
+            w[RAPL_PL2] = w[RAPL_PL1]
+        return w
+
+    def end_pin(self, now):
+        """An override pin ended: back to the default allocation, but never during the backstop hold."""
+        if now < self.floor_until:
+            self.reset_pending = True
+        else:
+            self.reset()
 
     def thermal(self, dies, fan_full, dt):
         """Working-temperature ceilings: over T_WORK (or HBM_WORK) + band a die's ceiling comes down from its present
@@ -681,7 +1027,6 @@ class Budget:
             self.gpu = {a: float(GPU_CAP["floor"]) for a in self.gpu}
             self.pl1 = float(CPU_PL1["floor"])
             self.floor_until = now + BACKSTOP_HOLD
-            self.apply()
             self.over_n = 0
             return True
         return False
@@ -691,20 +1036,19 @@ class Budget:
         STEP_FRAC more per move, funded from free budget, then idle dies (toward their use + 30 %), then every die
         evenly. Saturated dies get free budget, idle siblings' budget, and the CPU's PL1 above CPU_KEEP of its use --
         never more, so a busy CPU keeps its headroom. Returns a short log string or None."""
-        if now < self.floor_until:
+        if now < self.floor_until:                            # the backstop hold outranks pins and resets
             return None
-        if self.pin is not None:                              # (GPU W or None, PL1 W or None): fixed limits, still
-            gp, pp = self.pin                                 # inside the invariant (a pin that does not fit shrinks)
-            g = {a: float(gp) for a in self.gpu} if gp else dict(self.gpu)
-            if pp:
-                floor = min(pp, CPU_PL1["floor"])
-                while self.room(g) < floor and min(g.values()) > GPU_CAP["floor"]:
-                    g = {a: v - 1 for a, v in g.items()}
-                self.gpu, self.pl1 = g, max(10.0, min(pp, self.room(g)))
-            else:
-                while self.room(g) < CPU_PL1["floor"] and min(g.values()) > GPU_CAP["floor"]:
-                    g = {a: v - 1 for a, v in g.items()}
-                self.gpu, self.pl1 = g, max(CPU_PL1["floor"], self.room(g))
+        if self.reset_pending:
+            self.reset_pending = False
+            self.reset()
+            return "backstop hold over: default allocation restored"
+        if self.pin is not None:                              # (GPU W or None, PL1 W or None): fixed limits, fitted
+            gp, pp = self.pin                                 # like any allocation (a pin that does not fit shrinks;
+            self.gpu = {a: float(gp) for a in self.gpu} if gp else dict(self.gpu)   # the CPU's charge counts)
+            self.pl1 = float(pp) if pp else float(CPU_PL1["max"])
+            self.fit(min(pp, CPU_PL1["floor"]) if pp else None)
+            return None
+        if self.degraded:                                     # no measured DC: demand-driven moves pause
             return None
         lo = GPU_CAP["floor"]
         top = {a: min(self.tcap[a], float(GPU_CAP["max"])) for a in self.gpu}   # thermal ceiling, never over the max
@@ -740,28 +1084,39 @@ class Budget:
         return f"rebalance ({why}): gpu {[round(v) for v in g.values()]} pl1 {round(pl1)}" if changed else None
 
 
+def finite(word):
+    """float(word), ValueError unless finite: NaN passes every min()/max() clamp unchanged."""
+    v = float(word)
+    if not math.isfinite(v):
+        raise ValueError(word)
+    return v
+
+
 def parse_override():
     """-> (mode, rpm dict or None, note) from OVERRIDE; ('auto', None, '') when absent, expired or malformed."""
     try:
         st = os.stat(OVERRIDE)
-        words = open(OVERRIDE).read().split()
-    except OSError:
+        with open(OVERRIDE, encoding="utf-8") as f:
+            words = f.read().split()
+    except FileNotFoundError:
         return "auto", None, "", None
+    except (OSError, ValueError):                          # unreadable, or not UTF-8 text
+        return "auto", None, "override ignored (unreadable or not text)", None
     ttl = [w for w in words if w.startswith("ttl=")]
     pin = [w for w in words if w.startswith("gpu=")]
     ppin = [w for w in words if w.startswith("pl1=")]
     words = [w for w in words if not w.startswith(("ttl=", "gpu=", "pl1="))]
     try:
-        pin = min(max(float(pin[0][4:]), GPU_CAP["floor"]), GPU_CAP["max"]) if pin else None
+        pin = min(max(finite(pin[0][4:]), GPU_CAP["floor"]), GPU_CAP["max"]) if pin else None
     except ValueError:
         pin = None
     try:
-        ppin = min(max(float(ppin[0][4:]), 10.0), CPU_PL1["max"]) if ppin else None   # may go under the floor
+        ppin = min(max(finite(ppin[0][4:]), 10.0), CPU_PL1["max"]) if ppin else None   # may go under the floor
     except ValueError:
         ppin = None
     pin = (pin, ppin) if (pin is not None or ppin is not None) else None
     try:
-        if ttl and time.time() - st.st_mtime > float(ttl[0][4:]):
+        if ttl and time.time() - st.st_mtime > finite(ttl[0][4:]):
             return "auto", None, "override expired", None
         pn = (f" gpu={pin[0]:.0f}" if pin and pin[0] else "") + (f" pl1={pin[1]:.0f}" if pin and pin[1] else "")
         if not words or words[0] == "auto":
@@ -769,7 +1124,7 @@ def parse_override():
         if words[0] == "max" and len(words) == 1:
             return "max", None, "override max" + pn, pin
         if words[0] == "hold" and len(words) == 1 + len(CAP):
-            rpm = {f: min(max(float(w), MIN_RPM[f]), CAP[f]) for f, w in zip(sorted(CAP), words[1:])}
+            rpm = {f: min(max(finite(w), MIN_RPM[f]), CAP[f]) for f, w in zip(sorted(CAP), words[1:])}
             return "hold", rpm, "override hold" + pn, pin
     except ValueError:
         pass
@@ -783,19 +1138,19 @@ CONFIGURABLE = ("ZONES", "BAY_TARGET", "HBM_TARGET", "CPU_TARGET", "CPU_BAND", "
                 "BACKSTOP")
 
 
-def load_config(path):
+def read_config(path):
     """NAME = value settings (Python literals) for the names in CONFIGURABLE; '#' starts a comment and an indented line
     continues the setting above it. A dict setting updates the default entry by entry (ZONES = {4: {"floor": 700}}
-    changes one floor). A setting that does not parse, names something else or changes a value's type is reported and
-    ignored: the defaults stay."""
+    changes one floor). -> (candidate {name: value}, errors); nothing is committed."""
     import ast
     try:
-        lines = open(path).read().splitlines()
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
     except FileNotFoundError:
-        return []
-    except OSError as e:
-        return [f"{path}: {e}"]
-    errors, g, items = [], globals(), []
+        return {}, []
+    except (OSError, ValueError) as e:                     # unreadable, or not UTF-8
+        return {}, [f"{path}: {e}"]
+    errors, cand, items = [], {}, []
     for n, line in enumerate(lines, 1):                    # an indented line continues the setting above it
         text = "" if line.lstrip().startswith("#") else line.split("#", 1)[0].rstrip()
         if text.strip() and text[0] in " \t" and items:
@@ -809,30 +1164,198 @@ def load_config(path):
             if not eq or name not in CONFIGURABLE:
                 raise ValueError(f"unknown setting {name!r}")
             v = ast.literal_eval(val.strip())
-            old = g[name]
-            if isinstance(old, float) and isinstance(v, int):
-                v = float(v)
-            if type(v) is not type(old) and not (isinstance(old, (int, float)) and isinstance(v, (int, float))):
-                raise ValueError(f"{name} must be a {type(old).__name__}")
-            if isinstance(old, dict):                       # a dict setting updates the default, entry by entry
+            old = cand.get(name, globals()[name])
+            if isinstance(old, dict):
+                if not isinstance(v, dict):
+                    raise ValueError(f"{name} must be a dict")
                 v = {**old, **{k: ({**old[k], **x} if isinstance(old.get(k), dict) and isinstance(x, dict) else x)
                                for k, x in v.items()}}
-            g[name] = v
-        except (ValueError, SyntaxError) as e:
-            errors.append(f"{path}:{n}: {e}; ignored")
+            cand[name] = v
+        except Exception as e:                              # noqa: BLE001 -- any malformed literal is an error, not
+            errors.append(f"{path}:{n}: {type(e).__name__}: {e}")   # a crash (the stop hook reads this file too)
+    return cand, errors
+
+
+def _num(v, lo=-math.inf, hi=math.inf):
+    try:
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and lo <= v <= hi
+    except (OverflowError, TypeError):                     # an int too large for a float
+        return False
+
+
+def _fan(v):
+    """A fan number (checked by type first: an unhashable value must not raise in a membership test)."""
+    return isinstance(v, int) and not isinstance(v, bool) and v in CAP
+
+
+def check_config(cand):
+    """Every setting's shape and range, and the budget's feasibility, for the candidate merged over the defaults.
+    -> errors (empty: safe to commit). Never raises: an unexpected shape is an error."""
+    try:
+        return _check_config(cand)
+    except Exception as e:                                 # noqa: BLE001
+        return [f"configuration rejected: {type(e).__name__}: {e}"]
+
+
+def _check_config(cand):
+    c = {k: cand.get(k, globals()[k]) for k in CONFIGURABLE}
+    e = []
+    fans = set(CAP)
+
+    def need(ok, msg):
+        if not ok:
+            e.append(msg)
+    z = c["ZONES"]
+    need(isinstance(z, dict) and all(_fan(f) for f in z) and set(z) == fans, f"ZONES must define fans {sorted(fans)}")
+    if isinstance(z, dict):
+        for f, d in z.items():
+            ok = (_fan(f) and isinstance(d, dict) and isinstance(d.get("name", ""), str)
+                  and _num(d.get("floor"), MIN_RPM.get(f, 0), CAP.get(f, 0))
+                  and _num(d.get("init"), MIN_RPM.get(f, 0), CAP.get(f, 0)))
+            need(ok, f"ZONES[{f!r}]: floor and init in rpm, {MIN_RPM.get(f)}..{CAP.get(f)}")
+    for k, lo, hi in (("BAY_TARGET", 20, 90), ("HBM_TARGET", 20, 95), ("BAND", 0.1, 5), ("CPU_BAND", 0.1, 5),
+                      ("CPU_TARGET_TAU", 1, 600), ("HBM_WORK", 40, 95), ("BUDGET_LIMIT", 100, 2000),
+                      ("K_GPU", 0.5, 2.0), ("K_CPU", 0.5, 2.0)):
+        need(_num(c[k], lo, hi), f"{k} must be a number in {lo}..{hi}")
+    lim = c["BUDGET_LIMIT"] if _num(c["BUDGET_LIMIT"]) else 0
+    need(_num(c["BUDGET_MARGIN"], 0, lim / 2), "BUDGET_MARGIN must be 0..BUDGET_LIMIT/2")
+    need(_num(c["BASE"], 0, lim), "BASE must be 0..BUDGET_LIMIT")
+    need(_num(c["BACKSTOP"], 100, lim), "BACKSTOP must be 100..BUDGET_LIMIT")
+    t = c["CPU_TARGET"]
+    need(isinstance(t, tuple) and len(t) == 2 and all(isinstance(p, tuple) and len(p) == 2 and _num(p[0], 0, 500)
+                                                       and _num(p[1], 20, 90) for p in t) and t[0][0] < t[1][0],
+         "CPU_TARGET must be ((W, C), (W, C)) with W rising, C 20..90")
+    t = c["T_WORK"]
+    need(isinstance(t, tuple) and len(t) == 2 and _num(t[0], 40, 95) and _num(t[1], 0.1, 5),
+         "T_WORK must be (C 40..95, band 0.1..5)")
+    t = c["CPU_KEEP"]
+    need(isinstance(t, tuple) and len(t) == 2 and _num(t[0], 1, 3) and _num(t[1], 0, 200),
+         "CPU_KEEP must be (factor 1..3, W 0..200)")
+    whole = lambda v: _num(v) and float(v).is_integer()   # limits are written in whole watts
+    g = c["GPU_CAP"]
+    need(not isinstance(g, dict) or all(whole(g.get(k)) for k in ("floor", "max", "init") if _num(g.get(k))),
+         "GPU_CAP values must be whole watts")
+    gf = g.get("floor") if isinstance(g, dict) and _num(g.get("floor")) else GPU_HW_MAX
+    need(isinstance(g, dict) and set(g) == {"floor", "max", "init"} and _num(g["floor"], 50, GPU_HW_MAX)
+         and _num(g["max"], gf, GPU_HW_MAX) and _num(g["init"], gf, GPU_HW_MAX),
+         f"GPU_CAP must be {{floor, max, init}} W with 50 <= floor <= max <= {GPU_HW_MAX:.0f} and floor <= init "
+         f"(init above max is lowered to max)")
+    p = c["CPU_PL1"]
+    need(not isinstance(p, dict) or all(whole(p.get(k)) for k in ("floor", "max") if _num(p.get(k))),
+         "CPU_PL1 values must be whole watts")
+    need(isinstance(p, dict) and set(p) == {"floor", "max"} and _num(p["floor"], LIMIT_MIN, CPU_HW_MAX)
+         and _num(p["max"], p["floor"] if _num(p["floor"]) else CPU_HW_MAX, CPU_HW_MAX),
+         f"CPU_PL1 must be {{floor, max}} W with {LIMIT_MIN:.0f} <= floor <= max <= {CPU_HW_MAX:.0f}")
+    pf = p.get("floor") if isinstance(p, dict) and _num(p.get("floor")) else CPU_HW_MAX
+    ss = c["STATIC_SAFE"]
+    need(not isinstance(ss, dict) or all(whole(ss.get(k)) for k in ("gpu", "pl1") if _num(ss.get(k))),
+         "STATIC_SAFE values must be whole watts")
+    need(isinstance(ss, dict) and set(ss) == {"gpu", "pl1"} and _num(ss["gpu"], gf, GPU_HW_MAX)
+         and (ss["pl1"] is None or _num(ss["pl1"], pf, CPU_HW_MAX)),
+         "STATIC_SAFE must be {gpu: W, pl1: W or None}, gpu no lower than GPU_CAP's floor, pl1 no lower than CPU_PL1's "
+         "(gpu above GPU_CAP's max is lowered to it)")
+    sm = c["SMC"]
+    need(isinstance(sm, dict) and all(isinstance(k, str) and isinstance(v, tuple) and len(v) == 4 and _fan(v[0])
+                                      and _num(v[1], 0, 120) and _num(v[2], v[1] if _num(v[1]) else 0, 130)
+                                      and _num(v[3], 0.1, 5) for k, v in sm.items()),
+         "SMC entries must be key: (fan, target C, emergency C > target, band)")
+    nv = c["NVME"]
+    need(isinstance(nv, tuple) and len(nv) == 3 and _fan(nv[0]) and _num(nv[1], 0, 100) and _num(nv[2], 0.1, 5),
+         "NVME must be (fan, target C, band)")
+    pe = c["PERIPH"]
+    need(isinstance(pe, dict) and all(isinstance(kk, str) and isinstance(v, tuple) and len(v) == 3 and _num(v[0], 0, 120) and _num(v[1], 0.1, 5)
+                                      and _num(v[2], 30, 150) for kk, v in pe.items()),
+         "PERIPH entries must be driver: (target C, band, critical C)")
+    dw = c["DEVICE_W"]
+    need(isinstance(dw, dict) and all(isinstance(k, str) for k in dw) and set(dw) >= {"mellanox", "nvme", "disk"}
+         and all(_num(v, 0, 500) for v in dw.values()),
+         "DEVICE_W must give W >= 0 for mellanox, nvme and disk")
+    need(isinstance(c["SLOT_ZONE"], dict) and all(isinstance(k, str) and _fan(v) for k, v in c["SLOT_ZONE"].items()),
+         "SLOT_ZONE must map slot names to fans")
+    need(_fan(c["DISK_ZONE"]), "DISK_ZONE must be a fan")
+    for k in ("DIES", "MPX_BAY"):
+        need(isinstance(c[k], dict) and all(isinstance(a, str) and b in (1, 2) and not isinstance(b, bool)
+                                            for a, b in c[k].items()), f"{k} values must be MPX bay 1 or 2")
+    if not e:                                   # feasibility: every floor together fits the budget
+        n = len(c["DIES"]) if c["DIES"] else len(die_map())
+        fixed = c["BASE"] + sum(c["DEVICE_W"].get(k, 0) * v for k, v in devices().items())
+        floor_cost = fixed + c["K_GPU"] * n * c["GPU_CAP"]["floor"] + c["K_CPU"] * c["CPU_PL1"]["floor"]
+        need(floor_cost <= c["BUDGET_LIMIT"] - c["BUDGET_MARGIN"],
+             f"budget infeasible: every limit at its floor costs {floor_cost:.0f} W > "
+             f"{c['BUDGET_LIMIT'] - c['BUDGET_MARGIN']:.0f} W")
+    return e
+
+
+def load_config(path):
+    """Read, validate and -- only if there is no error at all -- commit the settings. -> errors. Never raises: the
+    stop hook must reach its recovery with the built-in defaults whatever the file holds."""
+    try:
+        cand, errors = read_config(path)
+        errors += check_config(cand)
+    except Exception as e:                                 # noqa: BLE001
+        return [f"{path}: {type(e).__name__}: {e}"]
+    if not errors:
+        globals().update(cand)
     return errors
+
+
+def fans_full(smc):
+    """Every fan to its cap. Never the SMC's automatic mode."""
+    for f in CAP:
+        try:
+            wr(f"{smc}/fan{f}_manual", 1)
+            wr(f"{smc}/fan{f}_output", CAP[f])
+        except OSError as e:
+            log(error=f"fan{f} write failed: {e}")
+
+
+def stop_hook(smc):
+    """--stopped (ExecStopPost). Only a stop of the hardware owner recovers: the hook takes the owner lock, and if
+    another macpro-fand holds it (this run was refused because that one owns the fans and limits), it leaves them
+    alone. Otherwise, whatever the configuration file holds: every fan to its cap, the static-safe limits, and after a
+    clean stop t2fanrd (unless this stop is half of a restart)."""
+    try:
+        fd = open_lock(OWNER_LOCK)
+        owned = flock_within(fd, 3.0)
+    except OSError as e:
+        log(error=f"stop hook: {OWNER_LOCK}: {e}; recovering anyway")
+        owned = True
+    if not owned:
+        log(note="stop hook: another macpro-fand owns the fans and power limits: left alone")
+        return
+    if smc:
+        fans_full(smc)
+    try:
+        ok = write_static_safe()
+    except Exception as e:                                 # noqa: BLE001 -- the fans are already at their caps
+        log(error=f"stop hook: power recovery failed: {type(e).__name__}: {e}")
+        ok = False
+    if ok is False:
+        log(error="stop hook: static-safe power limits not confirmed (fans at their caps)")
+    if smc and ok is not False and os.environ.get("SERVICE_RESULT") == "success":
+        if unit_exists("t2fanrd.service") and not own_unit_restarting():
+            systemctl("start", "--no-block", "t2fanrd.service")
 
 
 def main():
     ap = argparse.ArgumentParser(prog="macpro-fand", description="Mac Pro 7,1 zone fan control and power budget")
-    ap.add_argument("--dry-run", action="store_true", help="compute and log, write nothing")
-    ap.add_argument("--release", action="store_true", help="hand the fans to t2fanrd (every fan to its cap first)")
-    ap.add_argument("--stopped", action="store_true", help="systemd ExecStopPost hook")
+    mode_arg = ap.add_mutually_exclusive_group()
+    mode_arg.add_argument("--dry-run", action="store_true", help="compute and log, write no fan or power limit")
+    mode_arg.add_argument("--release", action="store_true", help="hand the fans to t2fanrd (every fan to its cap first)")
+    mode_arg.add_argument("--stopped", action="store_true", help="systemd ExecStopPost hook")
+    mode_arg.add_argument("--check-config", action="store_true", help="validate the configuration and exit")
     ap.add_argument("--config", default=CONFIG, help=f"configuration file (default {CONFIG})")
     ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     args = ap.parse_args()
-    for e in load_config(args.config):
-        log(error=e)
+    cfg_errors = load_config(args.config)
+    for e in cfg_errors:
+        log(error=f"configuration: {e}")
+    if args.check_config:
+        print("configuration OK" if not cfg_errors else f"{len(cfg_errors)} configuration error(s); nothing applied")
+        sys.exit(EX_NOHW if cfg_errors else 0)
+    if cfg_errors and not args.stopped:        # the stop hook carries on with the built-in defaults
+        log(error="invalid configuration: not starting (fix it, then: macpro-fand --check-config)")
+        sys.exit(EX_NOHW)
     global T_WORK
     if float(os.environ.get("MACPRO_FAND_TEST_TWORK", "0") or 0):            # test hook: working temperature, C
         T_WORK = (float(os.environ["MACPRO_FAND_TEST_TWORK"]), T_WORK[1])
@@ -841,7 +1364,9 @@ def main():
         sys.exit(EX_NOHW)
 
     smc = find_smc()
-    if smc is None and not (args.release or args.stopped):
+    if args.stopped:  # ExecStopPost (systemd sets SERVICE_RESULT): fans first, then the power transaction
+        return stop_hook(smc)
+    if smc is None and not args.release:
         end = time.monotonic() + DISCOVER
         while smc is None and time.monotonic() < end:
             time.sleep(2)
@@ -854,13 +1379,7 @@ def main():
         return f"{smc}/fan{f}_{key}"
 
     def full():
-        """Every fan to its cap. Never the SMC's automatic mode."""
-        for f in CAP:
-            try:
-                wr(fan(f, "manual"), 1)
-                wr(fan(f, "output"), CAP[f])
-            except OSError as e:
-                log(error=f"fan{f} write failed: {e}")
+        fans_full(smc)
 
     def handback():
         """Clean stop: cap first, then t2fanrd (if installed) takes over with its own curve, unless this stop is
@@ -869,23 +1388,34 @@ def main():
         if unit_exists("t2fanrd.service") and not own_unit_restarting():
             systemctl("start", "--no-block", "t2fanrd.service")
 
+    # One hardware owner (a second instance, by hand or as a service, refuses before touching anything).
+    owner_fd = None
+    if not args.dry_run:
+        try:
+            owner_fd = open_lock(OWNER_LOCK)
+        except OSError as e:
+            sys.exit(f"cannot create {OWNER_LOCK}: {e}")
+        if not flock_within(owner_fd, 0):
+            sys.exit("another macpro-fand owns the fans and power limits (stop it first)")
     if args.release:
-        write_static_safe()
+        full()
+        if write_static_safe() is False:
+            log(error="--release: static-safe power limits not confirmed; fans left at their caps, t2fanrd not started")
+            sys.exit(1)
         return handback()
-    if args.stopped:  # systemd sets SERVICE_RESULT for ExecStopPost
-        if os.environ.get("SERVICE_RESULT") == "success":
-            handback()
-        else:
-            full()
-        return write_static_safe()
+
+    def make_die(a, b):
+        try:
+            return Die(a, b)
+        except (RuntimeError, KeyError, OSError, IndexError):
+            return None
 
     def discover():
+        """Every die of die_map() whose hwmon answers within 10 s (amdgpu reads can block); the rest are missing."""
         found, missing = [], []
         for a, b in die_map().items():
-            try:
-                found.append(Die(a, b))
-            except (RuntimeError, KeyError, OSError, IndexError):
-                missing.append(a)
+            done, d = io_call(lambda: make_die(a, b), time.monotonic() + 10.0)
+            (found if done and d else missing).append(d if done and d else a)
         return found, missing
 
     dies, missing_dies = discover()
@@ -895,7 +1425,12 @@ def main():
         time.sleep(2)
         dies, missing_dies = discover()
     if missing_dies:
-        log(error=f"dies missing after {DISCOVER:.0f} s: {missing_dies}; running with every fan at its cap")
+        log(error=f"dies missing after {DISCOVER:.0f} s: {missing_dies}; charged {GPU_HW_MAX:.0f} W each, "
+                  f"every fan at its cap")
+    odd = [a for a in die_map() if not gpu_model_ok(a)]
+    if odd:
+        log(error=f"GPU dies that are not Vega 20: {odd}; the power budget's bounds and calibration are Vega 20's "
+                  f"(unsupported)")
     core = hwmon_named("coretemp")
     pkg = temp_labels(core[0]).get("Package id 0") if core else None
     if pkg is None:
@@ -908,7 +1443,8 @@ def main():
         sys.exit(f"SMC sensors not found: {missing}")
     smc_s = {k: (z, t, e, b, Sensor(smc_lab[k] + "_input", 1000, 10.0)) for k, (z, t, e, b) in SMC.items()}
     # internal flash (Apple vendor id) on the blower; production devices by slot (PERIPH), each with its own target
-    if any(rds(b + "/queue/rotational") == "1" for b in glob.glob("/sys/block/sd*")) and not hwmon_named("drivetemp"):
+    if (not args.dry_run and not hwmon_named("drivetemp")
+            and any(rds(b + "/queue/rotational") == "1" for b in glob.glob("/sys/block/sd*"))):
         subprocess.run(["modprobe", "drivetemp"], capture_output=True)
     for name, (tgt, band, crit0) in PERIPH.items():
         for h in hwmon_named(name):
@@ -939,65 +1475,77 @@ def main():
         if unit_active("t2fanrd.service"):
             sys.exit("t2fanrd is running: stop it first (the unit file has Conflicts=t2fanrd.service)")
 
-    gov = {f: Governor(f) for f in CAP}
-    cmd = {f: gov[f].rpm for f in CAP}
-    budget = None
-    if budget_ready():
-        cap_paths = {d.addr: os.path.dirname(d.paths[0]) + "/power1_cap" for d in dies}
-        budget = Budget(cap_paths, args.dry_run)
-        smc_dc = SmcKey(smc, "PZ0G")
-        if not args.dry_run and not budget.apply():
-            log(error=f"budget write failed at start: {budget.failed}")
-        log(budget={"limit": budget.limit, "backstop": budget.backstop, "gpu": [round(v) for v in budget.gpu.values()],
-                    "pl1": round(budget.pl1), "cost": round(budget.cost()), "dc_key": smc_dc.idx is not None,
-                    "base": base(), "devices": devices(),
-                    "static_safe": static_safe()})
-    else:
-        log(budget="disabled: BASE/K_GPU/K_CPU not calibrated")
-    rapl_e, pkg_w = [None, None], None
-    last_budget = 0.0
-    written = {f: None for f in CAP}
-    ref = {f: (None, 0.0) for f in CAP}       # (setting the fan is converging on, since when)
-    bad_since = {f: None for f in CAP}
-    good_since = {f: None for f in CAP}
-    failed = {f: False for f in CAP}          # latched until the fan follows its setting again for FAN_FAIL
-    owner_fails = 0
-    gpu = GpuReader(dies)
-    gpu.start()
-
-    def put(f, rpm):
-        if args.dry_run:
-            return
-        wr(fan(f, "manual"), 1)
-        wr(fan(f, "output"), rpm)
-
-    def take_over():
-        """Write the floors until every fan reads back manual at its setting (t2fanrd's exit can reset a fan to
-        automatic after our first write)."""
-        end = time.monotonic() + HANDOVER
-        while time.monotonic() < end:
-            for f in CAP:
-                put(f, int(cmd[f]))
-            time.sleep(1.0)
-            if all(rds(fan(f, "manual")) == "1" and abs((rd(fan(f, "output")) or 0) - int(cmd[f])) <= 5 for f in CAP):
-                for f in CAP:
-                    written[f] = int(cmd[f])
-                return True
-        return False
-
     def stop(*_):
         raise SystemExit(0)
 
+    # From the first hardware write on, every exit path below runs the cleanup in `finally`.
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    if not args.dry_run and not take_over():
-        full()
-        sys.exit("fans do not hold manual settings after the handover: left at the cap")
-    notify("READY=1")
-    last = time.monotonic()
-    last_log = -LOG_EVERY
-    last_note = ""
+    gov = {f: Governor(f) for f in CAP}
+    cmd = {f: gov[f].rpm for f in CAP}
+    written = {f: None for f in CAP}
+    budget, worker, smc_dc = None, None, None
     try:
+        if budget_ready():
+            budget = Budget({d.addr: os.path.dirname(d.paths[0]) + "/power1_cap" for d in dies}, len(missing_dies))
+            enforcing, pl2_present = rapl_state()
+            budget.pl2_held = pl2_present and os.path.exists(RAPL_PL2)
+            budget.cpu_charge(rd(RAPL_PL2), enforcing)
+            fits = budget.fit()
+            smc_dc = SmcKey(smc, "PZ0G")
+            if not args.dry_run:
+                worker = PowerWorker()
+                worker.start()
+                worker.set(budget.want(), () if budget.pl2_held else (RAPL_PL2,), budget.cost() <= budget.limit + 1e-6)
+            log(budget={"limit": budget.limit, "backstop": budget.backstop,
+                        "gpu": [round(v) for v in budget.gpu.values()], "pl1": round(budget.pl1),
+                        "cost": round(budget.cost()), "fits": fits, "dc_key": smc_dc.idx is not None,
+                        "base": base(), "devices": devices(), "unmanaged_dies": missing_dies,
+                        "rapl_enforcing": enforcing, "pl2_held": budget.pl2_held,
+                        "static_safe": static_safe(len(dies), len(missing_dies))})
+        else:
+            log(budget="disabled: BASE/K_GPU/K_CPU not calibrated")
+        rapl_e, pkg_w = [None, None], None
+        rapl_max = rd(RAPL_ZONE + "/max_energy_range_uj")
+        last_budget, dc_missing_since, was_feasible = 0.0, None, True
+        last_seq = {d.addr: None for d in dies}
+        last_t = {d.addr: None for d in dies}     # when each die's last fed reading was taken
+        ref = {f: (None, 0.0) for f in CAP}       # (setting the fan is converging on, since when)
+        bad_since = {f: None for f in CAP}
+        good_since = {f: None for f in CAP}
+        failed = {f: False for f in CAP}          # latched until the fan follows its setting again for FAN_FAIL
+        owner_fails = 0
+        gpu = GpuReader(dies)
+        gpu.start()
+
+        def put(f, rpm):
+            if args.dry_run:
+                return
+            wr(fan(f, "manual"), 1)
+            wr(fan(f, "output"), rpm)
+
+        def take_over():
+            """Write the floors until every fan reads back manual at its setting (t2fanrd's exit can reset a fan to
+            automatic after our first write)."""
+            end = time.monotonic() + HANDOVER
+            while time.monotonic() < end:
+                for f in CAP:
+                    put(f, int(cmd[f]))
+                time.sleep(1.0)
+                if all(rds(fan(f, "manual")) == "1" and abs((rd(fan(f, "output")) or 0) - int(cmd[f])) <= 5
+                       for f in CAP):
+                    for f in CAP:
+                        written[f] = int(cmd[f])
+                    return True
+            return False
+
+        if not args.dry_run and not take_over():
+            full()
+            sys.exit("fans do not hold manual settings after the handover: left at the cap")
+        notify("READY=1")
+        last = time.monotonic()
+        last_log = -LOG_EVERY
+        last_note = ""
         while True:
             time.sleep(PERIOD)
             now = time.monotonic()
@@ -1006,26 +1554,38 @@ def main():
             ez = {f: [] for f in CAP}              # per zone: (reading - target) of every sensor it answers to
             mode, hold, note, pin = parse_override()
 
-            # GPU dies: worst junction and HBM error per bay, from the reader's latest snapshot
-            snap, age = gpu.latest()
+            # GPU dies: each die's own reading and age; temperatures checked on their own, power separately
+            snap = gpu.latest()
             alarms += [f"die {a} missing" for a in missing_dies]
-            if dies and (age is None or age > GPU_STALE):
-                alarms.append("gpu stale" if age is not None else "gpu no data")
             tj, tm = {1: [], 2: []}, {1: [], 2: []}
+            gpu_ok = bool(dies)
+            ages = []
             for d in dies:                         # (Vega 20 here has no runtime PM: the dies never suspend)
-                if snap is None or age is None or age > GPU_STALE:
-                    break
-                for flt, v in zip((d.tj, d.tm, d.p), snap[d.addr]):
-                    if not flt.feed(v, dt):
-                        alarms.append("read " + d.addr)
-                if None in (d.tj.raw, d.tm.raw, d.p.val):
+                ent = snap.get(d.addr)
+                if ent is None or ent[1] > GPU_STALE:
+                    alarms.append(f"gpu stale {d.addr}" if ent else f"gpu no data {d.addr}")
+                    gpu_ok = False
                     continue
-                if d.tj.raw >= d.jcrit - EMERG_MARGIN or d.tm.raw >= d.mcrit - EMERG_MARGIN:
+                vals, age, seq = ent
+                ages.append(age)
+                if seq != last_seq[d.addr]:        # a new reading: feed it once, over the time since the last one
+                    taken = now - age
+                    gap = PERIOD if last_t[d.addr] is None else min(GPU_STALE, max(0.0, taken - last_t[d.addr]))
+                    last_seq[d.addr], last_t[d.addr] = seq, taken
+                    for flt, v in zip((d.tj, d.tm, d.p), vals):
+                        flt.feed(v, gap)
+                if any(flt.fails >= READ_FAILS for flt in (d.tj, d.tm, d.p)):   # every loop, until a good reading
+                    alarms.append("read " + d.addr)
+                if (d.tj.raw is not None and d.tj.raw >= d.jcrit - EMERG_MARGIN) or \
+                        (d.tm.raw is not None and d.tm.raw >= d.mcrit - EMERG_MARGIN):
                     alarms.append("hot " + d.addr)
-                tj[d.bay].append(d.tj.val)
-                tm[d.bay].append(d.tm.val)
+                if d.tj.val is not None:
+                    tj[d.bay].append(d.tj.val)
+                if d.tm.val is not None:
+                    tm[d.bay].append(d.tm.val)
+            age = max(ages) if ages else None
             bay_t = {b: (sum(v) / len(v) if v else None) for b, v in tj.items()}
-            if budget and snap is not None and age is not None and age <= GPU_STALE:
+            if budget and gpu_ok:
                 budget.thermal({d.addr: (d.tj.val, d.tm.val, d.p.val, d.bay) for d in dies},
                                {b: gov[f].rpm >= CAP[f] - WRITE_STEP for b, f in BAY_FAN.items()}, dt)
             for b, f in BAY_FAN.items():
@@ -1036,9 +1596,8 @@ def main():
 
             # CPU package -> top front fan, at a target that follows package power
             e = rd(RAPL_E)
-            cpu_w = None
-            if e is not None and rapl_e[0] is not None and e >= rapl_e[1]:
-                cpu_w = (e - rapl_e[1]) / 1e6 / (now - rapl_e[0])
+            cpu_w = energy_rate(rapl_e, now, e, rapl_max)
+            if cpu_w is not None:
                 pkg_w = ema(pkg_w, cpu_w, dt, CPU_TARGET_TAU)
             rapl_e[:] = [now, e]
             if not cpu.update(dt):
@@ -1058,31 +1617,55 @@ def main():
                     alarms.append("hot " + k)
                 ez[zone].append((s.val - tgt, band))
 
-            # power budget: backstop every loop, reallocation every BUDGET_PERIOD (never on stale GPU data)
+            # power budget: backstop every loop, reallocation every BUDGET_PERIOD (never on stale GPU data); the
+            # power worker applies and confirms, the loop only plans
             if budget:
                 dc = smc_dc.read()
+                dc_missing_since = None if dc is not None else (dc_missing_since or now)
+                degraded = dc_missing_since is not None and now - dc_missing_since > DC_DEGRADED
+                if degraded != budget.degraded:
+                    budget.degraded = degraded
+                    log(budget_note="no measured DC: demand-driven reallocation paused (pins and the CPU's charge "
+                                    "still apply, inside the invariant)" if degraded
+                        else "measured DC back: reallocation resumes")
                 if budget.backstop_check(dc, now):
                     alarms.append(f"power backstop: DC {dc:.0f} W > {budget.backstop:.0f} W, every limit to its floor")
-                ext = [] if args.dry_run else budget.external()
-                if ext:
-                    log(budget_note=f"limits changed by someone else, ours restored: {ext}")
-                    budget.apply()
                 if budget.pin is not None and pin is None:
-                    budget.reset()
-                    budget.apply()
-                    log(budget_note="override pin ended: default allocation restored")
+                    budget.end_pin(now)
+                    log(budget_note="override pin ended: default allocation " +
+                        ("after the backstop hold" if budget.reset_pending else "restored"))
                 budget.pin = pin
-                gpu_ok = snap is not None and age is not None and age <= GPU_STALE
-                if now - last_budget >= BUDGET_PERIOD and gpu_ok:
+                st = worker.status() if worker else None
+                if st:
+                    for n in st["notes"]:
+                        log(budget_note=n)
+                    if st["pending"] and now - st["pending"][2] > POWER_STUCK:
+                        alarms.append(f"power limit {st['pending'][1]} stuck: {st['pending'][0]}")
+                    if st["fail_since"] and now - st["fail_since"] > POWER_FAILING:
+                        alarms.append(f"power limits not confirmed: {st['failed']}")
+                    if budget.pl2_held and st["pl2_bad"] >= 3:
+                        budget.pl2_held = False
+                        log(budget_note="PL2 cannot be held at PL1: the CPU is charged at PL2 as read back")
+                if now - last_budget >= BUDGET_PERIOD:
                     last_budget = now
-                    die_w = {d.addr: d.p.raw for d in dies}
-                    msg = budget.rebalance(now, die_w, cpu_w)
-                    if msg or budget.pin is not None:
-                        budget.apply()
-                    if msg:
-                        log(budget_note=msg, dc=r1(dc), cpu_w=r1(cpu_w))
-                if budget.failed:
-                    alarms.append(f"budget write failed: {budget.failed}")
+                    pl2_now = pl2_observed(st, now) if worker else rd(RAPL_PL2)     # (dry run: no worker)
+                    if budget.cpu_charge(pl2_now, rapl_state()[0]):
+                        log(budget_note=f"CPU charged at {budget.cpu_w():.0f} W (PL1 {budget.pl1:.0f} W)" +
+                            (", RAPL not enforcing or PL2 not held" if budget.cpu_min else ""))
+                    if gpu_ok:
+                        msg = budget.rebalance(now, {d.addr: d.p.raw for d in dies}, cpu_w)
+                        if msg:
+                            log(budget_note=msg, dc=r1(dc), cpu_w=r1(cpu_w))
+                feasible = budget.cost() <= budget.limit + 1e-6     # now, with the CPU's present charge -- not the
+                if not feasible:                                    # start's: an infeasible allocation alarms (fans
+                    alarms.append(f"budget infeasible: {budget.cost():.0f} W > {budget.limit:.0f} W even at the "
+                                  f"floors (CPU charged {budget.cpu_w():.0f} W)")   # to their caps) for as long as it lasts
+                if feasible != was_feasible:
+                    log(budget_note="budget infeasible: only lowering limits, every fan at its cap" if not feasible
+                        else "budget feasible again")
+                    was_feasible = feasible
+                if worker:
+                    worker.set(budget.want(), () if budget.pl2_held else (RAPL_PL2,), feasible)
 
             # fans: following their settings, and nobody else writing them
             for f in CAP:
@@ -1153,12 +1736,27 @@ def main():
                     zones={f: [r1(gov[f].err), round(gov[f].rate, 2), int(gov[f].rpm)] for f in CAP}, rpm=written,
                     budget=(None if not budget else {"gpu": [round(v) for v in budget.gpu.values()],
                             "pl1": round(budget.pl1), "cost": round(budget.cost()), "dc": r1(budget.dc),
-                            "tcap": [round(v) for v in budget.tcap.values()]}),
+                            "tcap": [round(v) for v in budget.tcap.values()], "cpu_w": round(budget.cpu_w()),
+                            "degraded": budget.degraded, "feasible": budget.cost() <= budget.limit + 1e-6,
+                            "confirmed": (st["ok"] if st else None)}),
                     tach={f: fan_in[f].raw for f in CAP})
     finally:
-        # Under systemd, ExecStopPost decides; run by hand, cap first and hand back to t2fanrd.
+        # Fans to their caps at once; then the power worker starts nothing more (under systemd ExecStopPost then
+        # recovers). Run by hand: only once the worker is idle for good, so no older write can land after it, the
+        # static-safe transaction, then t2fanrd. A worker stuck in the driver means no competing transaction: fans stay at their
+        # caps and the exit status says the recovery is incomplete.
+        if not args.dry_run:
+            full()                                # cooling first: the control loop has stopped
+        idle = worker.stop(2.0 if under_systemd() else STOP_DEADLINE) if worker else True
         if not args.dry_run and not under_systemd():
-            write_static_safe()
+            if not idle:
+                log(error="power recovery incomplete: a power-limit operation is stuck in the driver; fans left at "
+                          "their caps, t2fanrd not started")
+                raise SystemExit(1)
+            if write_static_safe() is False:
+                log(error="power recovery incomplete: static-safe limits not confirmed; fans left at their caps, "
+                          "t2fanrd not started")
+                raise SystemExit(1)
             handback()
 
 

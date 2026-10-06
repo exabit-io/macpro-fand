@@ -28,6 +28,11 @@ def load():
     spec = importlib.util.spec_from_loader("macpro_fand", loader)
     m = importlib.util.module_from_spec(spec)
     loader.exec_module(m)
+    # host inventory replaced by a fixture (the Mac Pro under test: four Vega 20 dies, no extra devices), so the result
+    # does not depend on the build host's GPUs, NVMe drives or disks
+    m.die_map = lambda: {"0b:00.0": 1, "0e:00.0": 1, "1b:00.0": 2, "1e:00.0": 2}
+    m.devices = lambda: {"mellanox": 0, "nvme": 0, "disk": 0}
+    m.gpu_model_ok = lambda addr: True
     return m
 
 
@@ -44,7 +49,7 @@ class Box:
     def __init__(self, m, base):
         self.m = m
         m._BASE = base
-        self.b = m.Budget({a: "/nonexistent" for a in DIES}, True)
+        self.b = m.Budget({a: "/nonexistent" for a in DIES})
         self.R = {a: 0.29 for a in DIES}
         self.R["1e:00.0"] = 0.34
         self.J = {a: 30.0 for a in DIES}
@@ -73,7 +78,7 @@ def test_configured_ceiling(m):
     reallocation raises a die above it, however idle the CPU."""
     m._BASE = m.BASE
     m.GPU_CAP["max"] = 125
-    b = m.Budget({a: "/nonexistent" for a in DIES}, True)
+    b = m.Budget({a: "/nonexistent" for a in DIES})
     for t in range(4, 200, 4):
         b.rebalance(float(t), {a: 0.97 * b.gpu[a] for a in DIES}, 20.0)
     check(max(b.gpu.values()) <= 125.0 + 1e-6,
@@ -115,7 +120,7 @@ def test_budget(m):
 def test_rapl_regulated_cpu(m):
     """With PL2 held at PL1, RAPL keeps the package near 90 % of PL1: that must count as saturated."""
     m._BASE = m.BASE
-    b = m.Budget({a: "/nonexistent" for a in DIES}, True)
+    b = m.Budget({a: "/nonexistent" for a in DIES})
     b.limit = 900.0
     b.reset()
     for t in range(4, 40, 4):                       # dies saturated, CPU idle: the dies borrow
@@ -128,7 +133,7 @@ def test_rapl_regulated_cpu(m):
 
 def test_pins_backstop(m):
     m._BASE = m.BASE
-    b = m.Budget({a: "/nonexistent" for a in DIES}, True)
+    b = m.Budget({a: "/nonexistent" for a in DIES})
     b.pin = (150.0, None)
     b.rebalance(4.0, {a: 140.0 for a in DIES}, 50.0)
     check(all(v == 150.0 for v in b.gpu.values()) and b.cost() <= b.limit + 1e-6,
@@ -156,17 +161,22 @@ def test_level(m):
 
 
 def test_config(m):
-    with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
-        f.write('# comment\nBAY_TARGET = 39\nT_WORK = (65.0, 1.0)  # trailing\nZONES = {4: {"floor": 700},\n'
-                '         1: {"init": 650}}\nFOO = 1\nBASE = "x"\nK_GPU = (1,\n')
-        path = f.name
-    errors = m.load_config(path)
-    os.unlink(path)
-    check(m.BAY_TARGET == 39.0 and m.T_WORK == (65.0, 1.0), "settings parse (int widened to float, tuple)")
+    def load(text):
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+            f.write(text)
+        errors = m.load_config(f.name)
+        os.unlink(f.name)
+        return errors
+    good = ('# comment\nBAY_TARGET = 39\nT_WORK = (65.0, 1.0)  # trailing\nZONES = {4: {"floor": 700},\n'
+            '         1: {"init": 650}}\n')
+    errors = load(good)
+    check(not errors and m.BAY_TARGET == 39.0 and m.T_WORK == (65.0, 1.0), f"settings parse ({errors})")
     check(m.ZONES[4]["floor"] == 700 and m.ZONES[4]["init"] == 500 and m.ZONES[1]["init"] == 650
           and m.ZONES[2]["init"] == 1150, "a dict setting merges entry by entry, across continuation lines")
-    check(len(errors) == 3 and m.BASE == 127.0 and m.K_GPU == 1.205,
-          f"unknown, mistyped and unparsable settings are ignored with a message ({len(errors)})")
+    m.BAY_TARGET = 37.8
+    errors = load(good + 'FOO = 1\nBASE = "x"\nK_GPU = (1,\n')
+    check(len(errors) == 3 and m.BAY_TARGET == 37.8 and m.BASE == 127.0 and m.K_GPU == 1.205,
+          f"any error: nothing is committed, every error reported ({len(errors)})")
 
 
 def test_cpu_target(m):

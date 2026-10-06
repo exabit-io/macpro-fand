@@ -13,9 +13,9 @@ _/etc/macpro-fand.conf_
 *macpro-fand*(8) reads this file once at start. Every setting is optional:
 the built-in defaults were measured on a Mac Pro 7,1 with a Xeon W-3275M and
 two Radeon Pro Vega II Duo modules, and the installed file lists them all,
-commented out. Restart the service after a change:
+commented out. Check the file and restart the service after a change:
 
-	systemctl restart macpro-fand
+	macpro-fand --check-config && systemctl restart macpro-fand
 
 # SYNTAX
 
@@ -23,8 +23,14 @@ One setting per line, *NAME = value*, where the value is a Python literal: a
 number, a tuple *(a, b)* or a dict *{key: value}*. A *#* starts a comment. An
 indented line continues the setting above it. A dict setting updates the
 default entry by entry, so *ZONES = {4: {"floor": 700}}* changes one floor
-and leaves the rest. A setting that does not parse, is not known, or changes
-the type of its default is logged and ignored; the default stays.
+and leaves the rest.
+
+The file is checked as a whole before any of it is used. A setting that does
+not parse or is not known, a value of the wrong type or shape or outside its
+range (numbers must be finite; booleans are not numbers), and floors that
+together do not fit the power budget are each reported, and *macpro-fand*
+refuses to start (exit status 78) with nothing applied. The stop hook alone
+carries on, with the built-in defaults.
 
 Fans are numbered as the applesmc driver numbers them: *1* the blower (memory
 side, 500-1200 rpm), *2* the bottom front fan (MPX bay 1 and the PCH), *3*
@@ -93,9 +99,11 @@ the middle front fan (MPX bay 2 and PCIe slots 5-8), *4* the top front fan
 	Range of a GPU die's cap and its default share, W; the built-in
 	maximum is Vega 20's 200 W. The installed file sets
 	*GPU_CAP = {"max": 125}*; comment that line out for the full range.
+	Whole watts. Required: 50 ≤ *floor* ≤ *max* ≤ 200 and *floor* ≤ *init*. A maximum
+	below *init* or the *STATIC_SAFE* GPU cap lowers those to it.
 
 *CPU_PL1* = _{"floor": 80, "max": 413}_
-	Range of the CPU's PL1, W.
+	Range of the CPU's PL1, whole watts; the floor is at least 10 W.
 
 *CPU_KEEP* = _(1.2, 20.0)_
 	A CPU below saturation keeps *a* × its draw + *b* W of PL1; the dies may
@@ -103,7 +111,11 @@ the middle front fan (MPX bay 2 and PCIe slots 5-8), *4* the top front fan
 
 *STATIC_SAFE* = _{"gpu": 125, "pl1": None}_
 	The limits written when the daemon stops or fails; *None* is the
-	largest PL1 the budget allows beside the GPU caps.
+	largest PL1 the budget allows beside the GPU caps. A die without a power
+	cap is charged at 200 W, and the GPU caps come down if the CPU's floor
+	would not fit beside them (or what the CPU can draw, while RAPL does not
+	enforce or PL2 will not follow PL1). Whole watts; the GPU value may not
+	be below *GPU_CAP*'s floor, nor *pl1* below *CPU_PL1*'s.
 
 *BACKSTOP* = _1190.0_
 	Measured DC, W, that drops every limit to its floor for 60 s.

@@ -37,8 +37,14 @@ equilibrium:
   used.
 - **Power budget:**
   - The rule is `BASE + 1.205 × Σ die caps + 1.156 × PL1 ≤ 1228 − 80 W`, with the constants calibrated on the machine.
-  - Power moves by demand, CPU first. Limits are always lowered before any limit is raised.
-  - PL2 is held at PL1.
+  - Power moves by demand, CPU first.
+  - One thread writes every power limit, so a blocked driver call never stalls the fans. Each change is one
+    transaction: decreases first, then any limit that could not be read goes to 10 W (the lowest value ever written),
+    and only with every limit confirmed do limits go up -- and only if the allocation fits the budget. Every write is read back, and the first that fails stops the transaction. Limits are
+    re-checked every 2 s and restored if they differ.
+  - PL2 is held at PL1. If it cannot be, or RAPL is not enforcing, the CPU is charged at what it can actually draw, in
+    every path: demand, pins and the stop hook.
+  - A die whose power cap cannot be managed is charged at Vega 20's 200 W maximum.
   - Uncapped devices found at start (Mellanox cards, extra NVMe drives, disks) add their worst case to the base.
   - A measured-DC backstop drops every limit to its floor.
 - **Full auto:** each GPU die's cap also follows its temperature, held at a working temperature that limits leakage.
@@ -46,6 +52,8 @@ equilibrium:
   Vega 20's full 200 W range.
 - **Clean stop:** every fan goes to full speed and then to `t2fanrd`. On a failure, every fan stays at full speed and
   the power limits go to a statically safe allocation.
+- **Strict configuration:** an invalid `/etc/macpro-fand.conf` is reported in full and the daemon does not start;
+  check a change with `macpro-fand --check-config`. One process owns the hardware: a second instance refuses to start.
 
 The details are in `macpro-fand(8)` and `macpro-fand.conf(5)`.
 
@@ -57,14 +65,16 @@ From the Exabit apt repository (Ubuntu 24.04):
 sudo install -d -m 755 /etc/apt/keyrings
 curl -fsSL https://exabit-io.github.io/resize-amdgpu-bars/keys/resize-amdgpu-bars.gpg \
     | sudo tee /etc/apt/keyrings/resize-amdgpu-bars.gpg > /dev/null
-echo 'deb [signed-by=/etc/apt/keyrings/resize-amdgpu-bars.gpg] https://github.com/exabit-io/resize-amdgpu-bars/releases/download/macpro-fand-1.0.1 ./' \
+echo 'deb [signed-by=/etc/apt/keyrings/resize-amdgpu-bars.gpg] https://github.com/exabit-io/macpro-fand/releases/download/macpro-fand-1.0.6 ./' \
     | sudo tee /etc/apt/sources.list.d/macpro-fand.list
 sudo apt update
 sudo apt install macpro-fand
 ```
 
 Requires the `applesmc-t2` driver (fan control through the T2 chip), `amdgpu`, `coretemp` and `intel-rapl`. The
-service starts on install and stops `t2fanrd`.
+service starts on install and stops `t2fanrd`. Each release is its own signed flat apt repository, tagged on the source
+commit it was built from: https://github.com/exabit-io/macpro-fand/releases (1.0.0 and 1.0.1 were published from
+exabit-io/resize-amdgpu-bars).
 
 ## Use
 
@@ -73,13 +83,14 @@ systemctl status macpro-fand
 journalctl -u macpro-fand -o cat | tail -1 | python3 -m json.tool    # full state, every 30 s
 
 echo "max ttl=600" > /run/macpro-fand/override                     # every fan at full speed for 10 min
-echo "auto gpu=150 ttl=7200" > /run/macpro-fand/override           # pin the GPU caps at 150 W for a benchmark
+echo "auto gpu=110 ttl=7200" > /run/macpro-fand/override           # pin the GPU caps at 110 W for a benchmark
 rm /run/macpro-fand/override                                       # back to normal
 
 systemctl stop macpro-fand                                         # hand the fans back to t2fanrd
 ```
 
-Settings (targets, calibration, hardware map) are in `/etc/macpro-fand.conf`, listed with their defaults.
+Settings (targets, calibration, hardware map) are in `/etc/macpro-fand.conf`, listed with their defaults. After a
+change: `macpro-fand --check-config && systemctl restart macpro-fand`.
 
 ## License
 

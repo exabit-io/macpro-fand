@@ -27,9 +27,11 @@ override_dh_auto_clean:
 	rm -rf tests/__pycache__
 
 # Offline tests: the budget invariant, CPU-first reallocation, the working-temperature ceilings and the settings parser,
-# against simulated sensors (no hardware is touched).
+# against simulated sensors; then the failure paths (power transactions, the power worker, locks, configuration
+# validation, the stop hook and the main loop against fakes). No hardware is touched.
 override_dh_auto_test:
 	python3 tests/test_macpro_fand.py ./$(SCRIPT)
+	python3 tests/test_safety.py ./$(SCRIPT)
 
 override_dh_installchangelogs:
 	dh_installchangelogs CHANGELOG.md
