@@ -8,3 +8,10 @@ debian/*.substvars
 debian/*.debhelper
 debian/*.debhelper.log
 debian/debhelper-build-stamp
+/target/
+/artifacts/
+*.deb
+*.buildinfo
+*.changes
+*.dsc
+*.tar.xz

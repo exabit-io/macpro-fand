@@ -28,9 +28,17 @@ and leaves the rest.
 The file is checked as a whole before any of it is used. A setting that does
 not parse or is not known, a value of the wrong type or shape or outside its
 range (numbers must be finite; booleans are not numbers), and floors that
-together do not fit the power budget are each reported, and *macpro-fand*
+together do not fit the power budget are rejected; the error is reported, and *macpro-fand*
 refuses to start (exit status 78) with nothing applied. The stop hook alone
 carries on, with the built-in defaults.
+
+Version 2 implements this syntax with a bounded, non-executing Rust parser;
+Python is not needed at runtime. Supported literals are finite numbers,
+single- or double-quoted strings with ordinary character escapes, tuples,
+lists, dicts, *True*, *False* and *None*. Expressions, comprehensions, bytes,
+raw strings and triple-quoted strings are not supported. The file must be
+a regular UTF-8 file no larger than 128 KiB, with at most 32 levels of
+literal nesting, 16384 literal nodes per setting, and 8 KiB per string.
 
 Fans are numbered as the applesmc driver numbers them: *1* the blower (memory
 side, 500-1200 rpm), *2* the bottom front fan (MPX bay 1 and the PCH), *3*

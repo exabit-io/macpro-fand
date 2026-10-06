@@ -1,5 +1,4 @@
 #!/usr/bin/make -f
-SCRIPT := macpro-fand
 PKGDIR := debian/macpro-fand
 MANSRC := $(wildcard man/*.scd)
 MANPAGES := $(MANSRC:.scd=)
@@ -7,31 +6,29 @@ MANPAGES := $(MANSRC:.scd=)
 %:
 	dh $@
 
-# The script's VERSION must equal the changelog version.
 .PHONY: check-version
 check-version:
-	@sv=$$(sed -n 's/^VERSION = "\(.*\)"/\1/p' $(SCRIPT)); \
+	@sv=$$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml); \
 	 cv=$$(dpkg-parsechangelog -SVersion | sed -E 's/^[0-9]+://; s/-[^-]*$$//'); \
 	 if [ "$$sv" != "$$cv" ]; then \
-	   echo "debian/rules: $(SCRIPT) says VERSION=$$sv but debian/changelog says $$cv" >&2; exit 1; \
-	 fi; echo "debian/rules: script version $$sv matches changelog"
+	   echo "Cargo.toml version $$sv differs from changelog $$cv" >&2; exit 1; \
+	 fi
 
-# '\" t on the first line makes man(1) run tbl for the zone table.
 man/%: man/%.scd
-	{ printf "'\\\\\" t\n"; scdoc < $<; } > $@
+	{ printf '%s\n' "'\\\" t"; scdoc < $<; } > $@
 
 override_dh_auto_build: check-version $(MANPAGES)
+	cargo build --locked --offline --release --bin macpro-fand
+
+override_dh_auto_test:
+	cargo test --locked --offline --all-targets
+	cargo build --locked --offline --example oracle
+	python3 tests/parity.py target/debug/examples/oracle
+	python3 tests/cli.py target/release/macpro-fand
 
 override_dh_auto_clean:
 	rm -f $(MANPAGES)
-	rm -rf tests/__pycache__
-
-# Offline tests: the budget invariant, CPU-first reallocation, the working-temperature ceilings and the settings parser,
-# against simulated sensors; then the failure paths (power transactions, the power worker, locks, configuration
-# validation, the stop hook and the main loop against fakes). No hardware is touched.
-override_dh_auto_test:
-	python3 tests/test_macpro_fand.py ./$(SCRIPT)
-	python3 tests/test_safety.py ./$(SCRIPT)
+	rm -rf target
 
 override_dh_installchangelogs:
 	dh_installchangelogs CHANGELOG.md
@@ -40,14 +37,11 @@ override_dh_installman:
 	dh_installman $(MANPAGES)
 
 override_dh_auto_install:
-	install -D -m 0755 $(SCRIPT) $(PKGDIR)/usr/sbin/macpro-fand
+	install -D -m 0755 target/release/macpro-fand $(PKGDIR)/usr/sbin/macpro-fand
 	install -D -m 0644 macpro-fand.conf $(PKGDIR)/etc/macpro-fand.conf
 
-# Start on install and restart on upgrade: the restart hands nothing to t2fanrd (the daemon sees its own restart
-# pending) and every fan sits at its cap for the few seconds between the two runs.
 override_dh_installsystemd:
 	dh_installsystemd
 
-# xz rather than zstd: debsigs signs xz members (and older dpkg reads them).
 override_dh_builddeb:
 	dh_builddeb -- -Zxz

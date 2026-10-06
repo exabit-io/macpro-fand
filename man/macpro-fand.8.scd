@@ -27,6 +27,12 @@ It normally runs as *macpro-fand.service*. Exactly one process may own the
 fans: starting the service stops t2fanrd, and a clean stop hands the fans
 back to t2fanrd.
 
+Version 2 is a native Rust daemon with the 1.0.6 policy and interfaces.
+It has no Python runtime dependency. It uses secure, singly linked,
+regular owner-lock files in a directory owned by the controlling uid and
+not writable by other users. If ownership or the t2fanrd service state
+cannot be established, it reports failure and starts no control session.
+
 ## Zones
 
 The case is divided into four airflow zones, each cooled mainly by one fan,
@@ -133,6 +139,10 @@ the limits go to a statically safe allocation: 125 W per die (or the
 configured maximum if lower), dies without a power cap charged at 200 W, and
 the largest PL1 the invariant allows.
 
+Version 2 samples the SMC DC key in its own thread under the shared SMC
+lock. A sample whose read started more than ten seconds ago is unusable;
+sustained missing samples then pause demand allocation as above.
+
 ## Writing the limits
 
 One thread does every power-limit read and write, so a driver call that
@@ -208,6 +218,8 @@ Override pins (below) suspend the ceilings.
 	refused because that one owns the hardware), it changes nothing. With
 	an invalid or unreadable configuration file it uses the built-in
 	defaults; t2fanrd is started only if the power limits were confirmed.
+	If ownership cannot be verified it changes nothing and exits 1. An
+	incomplete fan or power recovery also exits 1, leaving full cooling.
 
 *--check-config*
 	Check the configuration file (all of it; see *macpro-fand.conf*(5)),

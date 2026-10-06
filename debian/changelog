@@ -1,3 +1,18 @@
+macpro-fand (2.0.0) unstable; urgency=medium
+
+  * Rewrite the 1.0.6 daemon in Rust, preserving the CLI, configuration,
+    override file, fan policy, power allocator and systemd integration.
+  * Build a native package without a Python runtime or third-party crates.
+  * Isolate measured DC sampling from the fan loop. Fail closed when owner
+    locks or service state cannot be verified; report incomplete recovery.
+  * Sampler threads sleep on a condition variable that a stop wakes at
+    once; the control loop checks for a stop twice a second.
+  * Rust safety/lifecycle tests and differential tests against a pinned
+    copy of 1.0.6. Qualified on the Mac Pro 7,1: 27/27 hardware tests.
+    Against 1.0.6: -20 % CPU, -88 % memory, -50 % syscalls.
+
+ -- Exabit Networks <packages@exabit.io>  Tue, 06 Oct 2026 14:11:59 +0000
+
 macpro-fand (1.0.6) unstable; urgency=low
 
   * Documentation only (fifth external review of 1.0.5, which was not

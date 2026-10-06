@@ -2,6 +2,12 @@
 
 Zone fan control and a 1228 W power budget for the **Mac Pro 7,1 (2019)** on Linux.
 
+**2.0.0 is the Rust rewrite of 1.0.6**: the same fan and power policy, configuration, override file, command line and
+systemd unit, as a native executable without a Python runtime. It passed the same 27 hardware tests on the Mac Pro as
+1.0.6, against the exact executable the package installs, and its policy calculations are checked against the pinned
+1.0.6 source in 2,958 differential scenarios. Measured against 1.0.6 on the same machine, it uses 20 % less CPU,
+88 % less memory and half the syscalls, with the same wakeups and no Python runtime (details in the handoff).
+
 `macpro-fand` runs the four fans of a Mac Pro through the T2 `applesmc` driver as four independent zones, and keeps
 the whole machine under the 1228 W DC envelope of its power supply by managing the power caps of the GPU dies and the
 CPU's RAPL limits. It replaces `t2fanrd` as the fan owner.
@@ -52,29 +58,49 @@ equilibrium:
   Vega 20's full 200 W range.
 - **Clean stop:** every fan goes to full speed and then to `t2fanrd`. On a failure, every fan stays at full speed and
   the power limits go to a statically safe allocation.
-- **Strict configuration:** an invalid `/etc/macpro-fand.conf` is reported in full and the daemon does not start;
+- **Strict configuration:** an invalid `/etc/macpro-fand.conf` is reported and the daemon does not start;
   check a change with `macpro-fand --check-config`. One process owns the hardware: a second instance refuses to start.
 
 The details are in `macpro-fand(8)` and `macpro-fand.conf(5)`.
 
+## Build and verify
+
+Rust 1.75 or newer, Cargo, and x86-64 Linux are required. There are no third-party crates, downloaded build dependencies
+or Python runtime calls. Python 3 is needed for the development tests against the pinned specification.
+
+```sh
+make                 # target/release/macpro-fand
+make check           # Rust safety tests, differential policy checks and CLI checks; no hardware/service calls
+make fmt             # rustfmt and Clippy, warnings treated as errors
+make package         # unsigned native .deb; also requires debhelper, scdoc and dpkg-dev
+```
+
+The existing `/etc/macpro-fand.conf`, `/run/macpro-fand/override`, command-line options and systemd unit paths are
+preserved. The package installs `/usr/sbin/macpro-fand` and requires `systemd`, libc and libgcc, with no Python
+runtime dependency. Installation starts the service. Hardware prerequisites remain `applesmc-t2`, `amdgpu`, `coretemp`
+and `intel-rapl`.
+
 ## Install
 
-From the Exabit apt repository (Ubuntu 24.04):
+From the Exabit apt repository (Ubuntu 24.04, x86-64):
 
 ```sh
 sudo install -d -m 755 /etc/apt/keyrings
 curl -fsSL https://exabit-io.github.io/resize-amdgpu-bars/keys/resize-amdgpu-bars.gpg \
     | sudo tee /etc/apt/keyrings/resize-amdgpu-bars.gpg > /dev/null
-echo 'deb [signed-by=/etc/apt/keyrings/resize-amdgpu-bars.gpg] https://github.com/exabit-io/macpro-fand/releases/download/macpro-fand-1.0.6 ./' \
+echo 'deb [signed-by=/etc/apt/keyrings/resize-amdgpu-bars.gpg] https://github.com/exabit-io/macpro-fand/releases/download/macpro-fand-2.0.0 ./' \
     | sudo tee /etc/apt/sources.list.d/macpro-fand.list
 sudo apt update
 sudo apt install macpro-fand
 ```
 
-Requires the `applesmc-t2` driver (fan control through the T2 chip), `amdgpu`, `coretemp` and `intel-rapl`. The
-service starts on install and stops `t2fanrd`. Each release is its own signed flat apt repository, tagged on the source
-commit it was built from: https://github.com/exabit-io/macpro-fand/releases (1.0.0 and 1.0.1 were published from
-exabit-io/resize-amdgpu-bars).
+Each release is its own signed flat apt repository, tagged on the source commit it was built from:
+https://github.com/exabit-io/macpro-fand/releases. To go back to 1.0.6, point the source line at `macpro-fand-1.0.6` and
+`sudo apt install --allow-downgrades macpro-fand=1.0.6`.
+
+See [the engineering handoff](docs/v2-handoff.md) for architecture, compatibility differences, verification evidence
+and the hardware qualification procedure. The original daemon and its tests are retained under
+`reference/v1.0.6/`; they are never installed by the native package.
 
 ## Use
 

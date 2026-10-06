@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.0.0
+
+- Native Rust implementation of the 1.0.6 control policy, config, CLI, overrides and service interfaces.
+- One power worker with generation cancellation between operations; read-back transactions, conservative CPU
+  accounting, lower-only infeasible allocations, secure owner locks and deadline-bounded static recovery.
+- Independent DC sampler, early full cooling for known startup faults, and failure reporting when ownership,
+  service state, fan writes or recovery cannot be verified. Only clean foreground stops hand over to t2fanrd.
+- Bounded non-executing config parser, regular-file checks, no external crates or Python runtime dependency.
+- Native safety tests, 2,958 differential scenarios against the SHA-pinned specification, and a hardware runner
+  adapted for the native executable. Qualified on the Mac Pro 7,1: 27/27 hardware tests on the released executable.
+- Costs less than 1.0.6: -20 % CPU at idle (-18 % under GPU load), -88 % memory, -50 % syscalls, -58 % startup CPU,
+  the same wakeups, and no Python runtime. The sampler threads sleep on a condition variable that a stop wakes at
+  once; the control loop checks for a stop twice a second.
+
 ## 1.0.6
 
 Documentation only, from a fifth external review of 1.0.5 (1.0.5 was not released). The daemon's code is unchanged.

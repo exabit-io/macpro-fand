@@ -1,0 +1,20 @@
+[package]
+name = "macpro-fand"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Mac Pro 7,1 fan controller and power budget daemon"
+repository = "https://github.com/exabit-io/macpro-fand"
+
+[dependencies]
+
+[profile.release]
+panic = "unwind"
+lto = true
+codegen-units = 1
+strip = "debuginfo"
+
+[[bin]]
+name = "macpro-fand"
+path = "src/main.rs"
