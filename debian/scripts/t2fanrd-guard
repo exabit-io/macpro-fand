@@ -1,0 +1,31 @@
+#!/bin/sh
+# t2fanrd-guard -- installed by macpro-fand for t2fanrd.service (t2fanrd.service.d/macpro-fand-backup.conf).
+# t2fanrd is macpro-fand's backup governor.
+#   t2fanrd-guard may-start   ExecCondition: exit 1 (skip the start) while a macpro-fand unit owns the fans or is
+#                             about to (active, starting, or waiting to restart); exit 0 otherwise.
+#   t2fanrd-guard stopped     ExecStopPost: when t2fanrd stops after running and no macpro-fand owns the fans,
+#                             every fan goes to full speed. Nothing on a refused start (SERVICE_RESULT=exec-condition).
+owner() {
+	for unit in macpro-fand.service macpro-fand-test.service; do
+		state=$(systemctl show --property=ActiveState --property=SubState --value "$unit" 2>/dev/null | tr '\n' ' ')
+		case "$state" in
+		active* | activating* | reloading* | *auto-restart*) echo "$unit (${state% })"; return 0 ;;
+		esac
+	done
+	return 1
+}
+case "$1" in
+may-start)
+	if o=$(owner); then echo "t2fanrd not started: $o owns the fans" >&2; exit 1; fi
+	exit 0
+	;;
+stopped)
+	[ "${SERVICE_RESULT:-}" = exec-condition ] && exit 0
+	if o=$(owner); then echo "t2fanrd stopped; $o owns the fans"; exit 0; fi
+	exec /usr/lib/macpro-fand/fans-to-max
+	;;
+*)
+	echo "usage: t2fanrd-guard may-start|stopped" >&2
+	exit 2
+	;;
+esac

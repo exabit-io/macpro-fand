@@ -17,7 +17,7 @@ def check(args, code, part):
     checks += 1
 
 
-check(["--version"], 0, "macpro-fand 2.0.0")
+check(["--version"], 0, "macpro-fand 2.0.1")
 check(["--help"], 0, "--stopped")
 check(["--dry-run", "--release"], 2, "select only one")
 check(["--config"], 2, "needs a path")

@@ -39,9 +39,14 @@ override_dh_installman:
 override_dh_auto_install:
 	install -D -m 0755 target/release/macpro-fand $(PKGDIR)/usr/sbin/macpro-fand
 	install -D -m 0644 macpro-fand.conf $(PKGDIR)/etc/macpro-fand.conf
+	install -D -m 0755 -t $(PKGDIR)/usr/lib/macpro-fand debian/scripts/fans-to-max debian/scripts/backup debian/scripts/t2fanrd-guard
+	install -D -m 0644 debian/macpro-fand-backup.service $(PKGDIR)/usr/lib/systemd/system/macpro-fand-backup.service
+	install -D -m 0644 debian/t2fanrd.service.d/macpro-fand-backup.conf $(PKGDIR)/usr/lib/systemd/system/t2fanrd.service.d/macpro-fand-backup.conf
 
+# Only macpro-fand.service is enabled and started by the maintainer scripts. macpro-fand-backup.service runs
+# only through OnFailure=: starting it on install would run the failure path (fans to full speed, t2fanrd).
 override_dh_installsystemd:
-	dh_installsystemd
+	dh_installsystemd macpro-fand.service
 
 override_dh_builddeb:
 	dh_builddeb -- -Zxz

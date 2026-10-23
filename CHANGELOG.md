@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.0.1
+
+systemd integration and packaging only; the daemon's code is unchanged.
+
+- **macpro-fand takes priority over t2fanrd; t2fanrd is an optional backup.** 2.0.0 declared
+  `Conflicts=t2fanrd.service`, and that dependency is symmetric: anything that started t2fanrd (a test script, a package
+  upgrade, an administrator) stopped macpro-fand and cancelled its pending restart. On 2026-10-22 a start of t2fanrd
+  in the 2 s restart window after a watchdog timeout left macpro-fand down for three hours. Now:
+  - starting macpro-fand stops t2fanrd and waits until it has fully exited (`ExecStartPre`), so the fans never have
+    two writers;
+  - t2fanrd cannot start while macpro-fand is active, starting or waiting to restart: the package installs a t2fanrd
+    drop-in (`t2fanrd.service.d/macpro-fand-backup.conf`) whose `ExecCondition` skips the start;
+  - t2fanrd takes over when macpro-fand stops cleanly (the stop hook's handover, unchanged) or fails for good
+    (`OnFailure=macpro-fand-backup.service`);
+  - t2fanrd is not required: without it, `Suggests:` only, nothing else changes.
+- **Fail-safe to full speed** whenever neither governor runs: macpro-fand's failure path (unchanged), the new
+  `macpro-fand-backup.service` (every fan to full speed, then t2fanrd if installed), and t2fanrd's stop hook (when it
+  stops after running and macpro-fand is not taking the fans). The new `/usr/lib/macpro-fand/fans-to-max` acts only on a
+  MacPro7,1 and never uses the SMC's automatic mode.
+- **Install:** t2fanrd is disabled at boot on install and enabled again on removal. The service start that debhelper
+  runs quietly is now reported: the postinst says when the start can take minutes and, if the service is not running
+  afterwards, prints its state and last messages instead of finishing silently.
+- **Start timeout 300 -> 540 s:** the start waits up to 240 s for applesmc and then up to 240 s for the amdgpu dies;
+  300 s let systemd kill a start that would have succeeded when both drivers came up late.
+- Hardware tests: T9 (a t2fanrd start beside macpro-fand is refused), T11 (the restart window), T12 (permanent failure:
+  full speed, then t2fanrd), T13 (t2fanrd stopping with no owner: full speed), T14 (no t2fanrd: full speed).
+
 ## 2.0.0
 
 - Native Rust implementation of the 1.0.6 control policy, config, CLI, overrides and service interfaces.

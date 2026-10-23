@@ -1,0 +1,10 @@
+#!/bin/sh
+# backup -- macpro-fand-backup.service, started by macpro-fand.service's OnFailure= when macpro-fand fails for good.
+# Fans to full speed first; then the t2fanrd backup governor if it is installed. Without it the fans stay at full speed.
+/usr/lib/macpro-fand/fans-to-max
+if [ "$(systemctl show --property=LoadState --value t2fanrd.service 2>/dev/null)" = loaded ]; then
+	systemctl start --no-block t2fanrd.service && echo "macpro-fand failed: t2fanrd (backup governor) started"
+else
+	echo "macpro-fand failed: no t2fanrd backup installed; fans stay at full speed"
+fi
+exit 0

@@ -1,3 +1,19 @@
+macpro-fand (2.0.1) unstable; urgency=medium
+
+  * macpro-fand takes priority over t2fanrd, which becomes an optional
+    backup: drop the symmetric Conflicts=t2fanrd.service (starting t2fanrd
+    stopped macpro-fand); stop t2fanrd in ExecStartPre and wait for it; ship
+    a t2fanrd drop-in whose ExecCondition refuses to start it beside
+    macpro-fand; OnFailure= starts macpro-fand-backup.service.
+  * Fail-safe to full speed when neither governor runs (fans-to-max,
+    MacPro7,1 only): macpro-fand-backup.service and t2fanrd's stop hook.
+  * Disable t2fanrd at boot on install, enable it again on removal; report a
+    service that did not start after install.
+  * TimeoutStartSec 300 -> 540 s (applesmc and amdgpu waits of 240 s each).
+  * Hardware tests T9, T11-T14.
+
+ -- Exabit Networks <packages@exabit.io>  Fri, 23 Oct 2026 00:52:16 +0000
+
 macpro-fand (2.0.0) unstable; urgency=medium
 
   * Rewrite the 1.0.6 daemon in Rust, preserving the CLI, configuration,

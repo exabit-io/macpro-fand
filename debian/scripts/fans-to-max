@@ -1,0 +1,20 @@
+#!/bin/sh
+# fans-to-max -- the Mac Pro 7,1 fan failsafe, installed by macpro-fand: every SMC fan in manual mode at its maximum.
+# Whenever no governor owns the fans (macpro-fand failed for good, t2fanrd stopped or absent) they run at full speed;
+# never the SMC's automatic mode. Exits 0, touching nothing, on anything but a MacPro7,1.
+case "$(tr '[:upper:]' '[:lower:]' < /sys/class/dmi/id/product_name 2>/dev/null)" in
+*macpro7,1*) ;;
+*) echo "fans-to-max: not a MacPro7,1; fans left alone" >&2; exit 0 ;;
+esac
+n=0; rc=0
+for max in /sys/bus/acpi/devices/APP0001:*/fan*_max; do
+	[ -r "$max" ] || continue
+	base=${max%_max}
+	v=$(cat "$max") || { rc=1; continue; }
+	echo 1 > "${base}_manual" 2>/dev/null || rc=1
+	echo "$v" > "${base}_output" 2>/dev/null || rc=1
+	n=$((n + 1))
+done
+if [ $n -eq 0 ]; then echo "fans-to-max: no Mac Pro SMC fans found" >&2; exit 0; fi
+if [ $rc -eq 0 ]; then echo "fans-to-max: $n fans at full speed"; else echo "fans-to-max: could not set every fan" >&2; fi
+exit $rc

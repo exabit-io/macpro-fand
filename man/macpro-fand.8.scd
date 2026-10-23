@@ -24,8 +24,15 @@ minimum while the GPU dies soak at 58 °C and above, and the leakage current of
 the hot silicon costs more power than the fans would.
 
 It normally runs as *macpro-fand.service*. Exactly one process may own the
-fans: starting the service stops t2fanrd, and a clean stop hands the fans
-back to t2fanrd.
+fans, and macpro-fand wins: t2fanrd is its backup governor. Starting the
+service stops t2fanrd; t2fanrd cannot start while the service is active,
+starting or waiting to restart (the package installs a t2fanrd drop-in,
+*t2fanrd.service.d/macpro-fand-backup.conf*); a clean stop hands the fans
+back to t2fanrd, and a permanent failure starts *macpro-fand-backup.service*
+(*OnFailure=*), which sets every fan to full speed and then starts t2fanrd if
+it is installed. t2fanrd is optional. Whenever neither governor runs, every
+fan runs at full speed. The package disables t2fanrd at boot and enables it
+again when macpro-fand is removed.
 
 Version 2 is a native Rust daemon with the 1.0.6 policy and interfaces.
 It has no Python runtime dependency. It uses secure, singly linked,

@@ -10,7 +10,7 @@ systemd unit, as a native executable without a Python runtime. It passed the sam
 
 `macpro-fand` runs the four fans of a Mac Pro through the T2 `applesmc` driver as four independent zones, and keeps
 the whole machine under the 1228 W DC envelope of its power supply by managing the power caps of the GPU dies and the
-CPU's RAPL limits. It replaces `t2fanrd` as the fan owner.
+CPU's RAPL limits. It replaces `t2fanrd` as the fan owner and keeps it as a backup governor.
 
 ## Why
 
@@ -58,6 +58,11 @@ equilibrium:
   Vega 20's full 200 W range.
 - **Clean stop:** every fan goes to full speed and then to `t2fanrd`. On a failure, every fan stays at full speed and
   the power limits go to a statically safe allocation.
+- **t2fanrd is an optional backup:** it is not required. When it is installed, starting macpro-fand stops it, and it
+  cannot start while macpro-fand is running, starting or waiting to restart (a drop-in this package installs). t2fanrd
+  takes over only when macpro-fand stops cleanly or fails for good; it is disabled at boot while macpro-fand is installed.
+- **Fail-safe:** whenever neither governor runs, every fan runs at full speed: macpro-fand's failure path, the
+  `macpro-fand-backup` unit (full speed, then t2fanrd if installed) and t2fanrd's stop hook.
 - **Strict configuration:** an invalid `/etc/macpro-fand.conf` is reported and the daemon does not start;
   check a change with `macpro-fand --check-config`. One process owns the hardware: a second instance refuses to start.
 
@@ -73,6 +78,7 @@ make                 # target/release/macpro-fand
 make check           # Rust safety tests, differential policy checks and CLI checks; no hardware/service calls
 make fmt             # rustfmt and Clippy, warnings treated as errors
 make package         # unsigned native .deb; also requires debhelper, scdoc and dpkg-dev
+sudo tests/hardware/failover-tests.sh   # on an installed package: the t2fanrd ownership rules, fans at full speed
 ```
 
 The existing `/etc/macpro-fand.conf`, `/run/macpro-fand/override`, command-line options and systemd unit paths are
@@ -88,7 +94,7 @@ From the Exabit apt repository (Ubuntu 24.04, x86-64):
 sudo install -d -m 755 /etc/apt/keyrings
 curl -fsSL https://exabit-io.github.io/resize-amdgpu-bars/keys/resize-amdgpu-bars.gpg \
     | sudo tee /etc/apt/keyrings/resize-amdgpu-bars.gpg > /dev/null
-echo 'deb [signed-by=/etc/apt/keyrings/resize-amdgpu-bars.gpg] https://github.com/exabit-io/macpro-fand/releases/download/macpro-fand-2.0.0 ./' \
+echo 'deb [signed-by=/etc/apt/keyrings/resize-amdgpu-bars.gpg] https://github.com/exabit-io/macpro-fand/releases/download/macpro-fand-2.0.1 ./' \
     | sudo tee /etc/apt/sources.list.d/macpro-fand.list
 sudo apt update
 sudo apt install macpro-fand

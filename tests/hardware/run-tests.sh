@@ -1,6 +1,8 @@
 #!/bin/bash
 # run-tests.sh -- failure-path tests for macpro-fand on the real box, as a transient unit that mirrors
-# macpro-fand.service (Type=notify, watchdog, Restart=always, Conflicts=t2fanrd, ExecStopPost --stopped).
+# macpro-fand.service (Type=notify, watchdog, Restart=always, ExecStartPre stops t2fanrd, OnFailure=macpro-fand-backup,
+# ExecStopPost --stopped; t2fanrd is the backup governor and its drop-in refuses to start it beside macpro-fand).
+# Needs the 2.0.1 system files installed (macpro-fand-backup.service, the t2fanrd drop-in and /usr/lib/macpro-fand/*).
 # Needs: idle box, no other fan experiment running, t2fanrd installed. Leaves t2fanrd in charge at the end.
 # Each test prints PASS/FAIL; the fans are never left below their t2fanrd/floor settings.
 # The machine's load and telemetry tools are parameters (no defaults outside this tree):
@@ -26,8 +28,9 @@ idle_jobs() { local end=$((SECONDS + 30)); while [ -n "$(systemctl list-jobs --n
 start_unit() {  # start_unit [ENV=VAL ...]; waits out pending jobs (a queued t2fanrd start makes ours "destructive")
   idle_jobs
   local env=(); for e in "$@"; do env+=(-p "Environment=$e"); done
-  systemd-run --unit=$U --collect -p Type=notify -p NotifyAccess=main -p WatchdogSec=20 -p Restart=always \
-    -p RestartSec=2 -p TimeoutStopSec=15 -p Conflicts=t2fanrd.service -p After=t2fanrd.service \
+  systemd-run --unit=$U --collect -p Type=notify -p NotifyAccess=main -p WatchdogSec=20 -p Restart=${RESTART:-always} \
+    -p RestartSec=2 -p TimeoutStopSec=15 -p OnFailure=macpro-fand-backup.service \
+    -p "ExecStartPre=-/usr/bin/systemctl stop t2fanrd.service" \
     -p "ExecStopPost=$BIN --stopped" "${env[@]}" "$BIN" --config "${CONF:-$D/tests/hardware/test.conf}" >/dev/null 2>&1
 }
 stop_unit() { systemctl stop $U 2>/dev/null; wait_active $U inactive 20; systemctl reset-failed $U 2>/dev/null; }
@@ -39,6 +42,8 @@ wait_governed() { local end=$((SECONDS + $1)); while [ $SECONDS -lt $end ]; do g
 # Read-only preflight first: nothing is stopped or removed when the box is not ready.
 [ -z "$(ls /sys/class/kfd/kfd/proc 2>/dev/null)" ] || { echo "a GPU job is running; not testing"; exit 2; }
 systemctl cat t2fanrd.service >/dev/null 2>&1 || { echo "t2fanrd is not installed; not testing"; exit 2; }
+systemctl cat t2fanrd.service 2>/dev/null | grep -q 't2fanrd-guard may-start' && systemctl cat macpro-fand-backup.service >/dev/null 2>&1 \
+  || { echo "the macpro-fand 2.0.1 system files (t2fanrd drop-in, macpro-fand-backup.service) are not installed; not testing"; exit 2; }
 exec 9<>/run/macpro-fand-experiment.lock && flock -n 9 || { echo "another experiment holds the experiment lock; not testing"; exit 2; }
 CONFIG_USED="${CONF:-$D/tests/hardware/test.conf}"
 "$BIN" --check-config --config "$CONFIG_USED" >/dev/null 2>&1 || { echo "invalid test configuration $CONFIG_USED"; exit 2; }
@@ -46,6 +51,7 @@ echo "macpro-fand $("$BIN" --version 2>&1 | awk '{print $2}') ($BIN -> $(readlin
 echo "tested daemon sha256 $(sha256sum < "$(readlink -f "$BIN")" | cut -c1-64); installed $(dpkg-query -W -f='${Version}' macpro-fand 2>/dev/null) sha256 $(sha256sum < /usr/sbin/macpro-fand 2>/dev/null | cut -c1-64)"
 # The state to give back on any exit: which fan owner was running, and the override file's exact content.
 INSTALLED=0; systemctl is-active --quiet macpro-fand && INSTALLED=1
+
 OVSAVE=$(mktemp); OVHAD=0
 [ -f $OV ] && { cp -p $OV "$OVSAVE" || { echo "cannot snapshot $OV; not testing"; rm -f "$OVSAVE"; exit 2; }; OVHAD=1; }
 LOGD=$(mktemp -d) || { echo "cannot create a private log directory; not testing"; rm -f "$OVSAVE"; exit 2; }
@@ -58,6 +64,7 @@ restore() {
       || { echo "RESTORE FAILED: override"; fail=$((fail + 1)); }
   else rm -f $OV; fi
   rm -f "$OVSAVE"; echo "logs: $LOGD"
+  systemctl unmask --runtime t2fanrd.service >/dev/null 2>&1
   idle_jobs
   if [ $INSTALLED = 1 ]; then
     systemctl start macpro-fand; wait_active macpro-fand active 60
@@ -94,7 +101,7 @@ timeout 10 "$BIN" > $LOGD/refuse.log 2>&1; rc=$?
 fi
 
 if want T2; then
-# T2 takeover: Conflicts stops t2fanrd, floors verified, READY
+# T2 takeover: ExecStartPre stops t2fanrd, floors verified, READY
 start_unit
 wait_active $U active 30 && ! systemctl is-active --quiet t2fanrd && wait_governed 20 \
   && ok "T2 takeover: t2fanrd stopped, governed: $(outs)" || bad "T2 takeover: unit $(systemctl is-active $U), t2fanrd $(systemctl is-active t2fanrd), $(outs) manual $(mans)"
@@ -151,10 +158,12 @@ systemctl reset-failed $U 2>/dev/null
 fi
 
 if want T9; then
-# T9 starting t2fanrd under a running macpro-fand stops it (Conflicts) and t2fanrd ends up in charge
-start_unit; wait_active $U active 30
-systemctl start t2fanrd; wait_active $U inactive 30 && wait_active t2fanrd active 30 && ok "T9 t2fanrd start stops macpro-fand" || bad "T9 conflict: unit $(systemctl is-active $U), t2fanrd $(systemctl is-active t2fanrd)"
-systemctl reset-failed $U 2>/dev/null
+# T9 macpro-fand wins: starting t2fanrd beside a running macpro-fand is refused (ExecCondition) and changes nothing
+start_unit; wait_active $U active 30; wait_governed 30
+systemctl start t2fanrd; sleep 5
+wait_active $U active 5 && ! systemctl is-active --quiet t2fanrd && governed \
+  && ok "T9 t2fanrd start beside macpro-fand is refused" || bad "T9: unit $(systemctl is-active $U), t2fanrd $(systemctl is-active t2fanrd), $(outs)"
+stop_unit
 fi
 
 # T10 'systemctl restart' keeps macpro-fand in charge (the stop hook must not hand the fans to t2fanrd mid-restart)
@@ -164,6 +173,49 @@ systemctl restart $U; sleep 3; idle_jobs
 wait_active $U active 30 && ! systemctl is-active --quiet t2fanrd && wait_governed 30 \
   && ok "T10 restart keeps macpro-fand in charge" || bad "T10 restart: unit $(systemctl is-active $U), t2fanrd $(systemctl is-active t2fanrd), $(outs)"
 stop_unit
+fi
+
+# T11 the restart window belongs to macpro-fand: after a crash (watchdog/SIGKILL), t2fanrd started during the 2 s
+# auto-restart wait is refused, and macpro-fand comes back in charge
+if want T11; then
+start_unit; wait_active $U active 30; wait_governed 30
+systemctl kill -s KILL $U; sleep 0.5
+systemctl start t2fanrd; sleep 1
+refused=1; systemctl is-active --quiet t2fanrd && refused=0
+wait_active $U active 30 && ! systemctl is-active --quiet t2fanrd && wait_governed 30 && [ $refused = 1 ] \
+  && ok "T11 t2fanrd refused in the restart window; macpro-fand back in charge" || bad "T11: refused=$refused unit $(systemctl is-active $U), t2fanrd $(systemctl is-active t2fanrd), $(outs)"
+stop_unit
+fi
+
+# T12 a permanent failure goes through macpro-fand-backup (full speed, then t2fanrd), and the next start takes the fans back
+if want T12; then
+RESTART=no start_unit; wait_active $U active 30; wait_governed 30
+systemctl kill -s KILL $U
+wait_active t2fanrd active 30 && [ "$(systemctl is-active $U)" != active ] && t12a=1 || t12a=0
+systemctl reset-failed $U 2>/dev/null; idle_jobs
+start_unit; wait_active $U active 30
+[ $t12a = 1 ] && ! systemctl is-active --quiet t2fanrd && wait_governed 30 \
+  && ok "T12 permanent failure -> t2fanrd; next start takes the fans back" || bad "T12: first=$t12a unit $(systemctl is-active $U), t2fanrd $(systemctl is-active t2fanrd), $(outs)"
+stop_unit
+fi
+
+# T13 fail-safe: t2fanrd stopping while no macpro-fand owns the fans leaves every fan at full speed
+if want T13; then
+idle_jobs; systemctl is-active --quiet t2fanrd || systemctl start t2fanrd; wait_active t2fanrd active 30; sleep 5
+systemctl stop t2fanrd
+wait_outs "$CAPS" 30 && [ "$(mans)" = 1111 ] && ok "T13 t2fanrd stop with no owner -> full speed: $(outs)" || bad "T13: $(outs) manual $(mans)"
+systemctl start t2fanrd; wait_active t2fanrd active 30
+fi
+
+# T14 fail-safe without the backup: t2fanrd unavailable (masked) and macpro-fand failed for good -> full speed, no t2fanrd
+if want T14; then
+RESTART=no start_unit; wait_active $U active 30; wait_governed 30
+systemctl mask --runtime t2fanrd.service >/dev/null 2>&1
+systemctl kill -s KILL $U; sleep 8; idle_jobs
+wait_outs "$CAPS" 30 && [ "$(mans)" = 1111 ] && ! systemctl is-active --quiet t2fanrd \
+  && ok "T14 no backup: fans stay at full speed" || bad "T14: $(outs) manual $(mans), t2fanrd $(systemctl is-active t2fanrd)"
+systemctl unmask --runtime t2fanrd.service >/dev/null 2>&1; systemctl reset-failed $U 2>/dev/null
+systemctl start t2fanrd; wait_active t2fanrd active 30
 fi
 
 # ---- power budget (needs the calibrated model in the daemon; loads stay well under 1228 W: GPU burn ~770 W) ----

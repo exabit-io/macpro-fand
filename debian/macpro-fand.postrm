@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+# With macpro-fand gone, t2fanrd is the fan governor again: let it start at boot.
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	if systemctl cat t2fanrd.service >/dev/null 2>&1 && ! systemctl is-enabled --quiet t2fanrd.service 2>/dev/null; then
+		systemctl enable t2fanrd.service >/dev/null 2>&1 || true
+		echo "macpro-fand removed: t2fanrd starts at boot again"
+	fi
+fi
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+# t2fanrd is macpro-fand's backup governor: it runs only when macpro-fand fails
+# for good (OnFailure=) or hands the fans over on a clean stop, never on its own
+# at boot. Its drop-in (t2fanrd.service.d/macpro-fand-backup.conf) also keeps it
+# from starting beside a running macpro-fand.
+if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
+	if systemctl is-enabled --quiet t2fanrd.service 2>/dev/null; then
+		systemctl disable t2fanrd.service >/dev/null 2>&1 || true
+		echo "macpro-fand: t2fanrd no longer starts at boot; it is macpro-fand's backup governor"
+	fi
+	echo "macpro-fand: starting; it waits for the applesmc and amdgpu drivers (up to 9 minutes on a cold machine)"
+fi
+
+#DEBHELPER#
+
+# debhelper starts the service quietly and ignores a failure; say so instead of
+# leaving a machine without its fan governor unnoticed.
+if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
+	if systemctl is-active --quiet macpro-fand.service; then
+		echo "macpro-fand: running"
+	else
+		echo "macpro-fand: NOT running ($(systemctl is-active macpro-fand.service 2>/dev/null)); the fans are at full speed or with t2fanrd. Last messages:" >&2
+		journalctl -u macpro-fand.service -b -n 20 -o cat --no-pager 2>/dev/null | grep -v '^{"alarms' | tail -4 >&2 || true
+		echo "macpro-fand: details: systemctl status macpro-fand; macpro-fand --check-config" >&2
+	fi
+fi
+
+exit 0

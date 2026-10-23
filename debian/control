@@ -25,5 +25,7 @@ Description: Zone fan control and 1228 W power budget for the Mac Pro 7,1
  the worst case of every limit together never exceeds the budget, and power
  moves to whichever consumer needs it, CPU first. Each GPU die's cap also
  follows its temperature, holding it at a working temperature that limits
- leakage. Replaces t2fanrd as the fan owner; a clean stop hands the fans back
- to t2fanrd.
+ leakage. Takes priority over t2fanrd, which is optional: when installed it is
+ the backup governor, unable to start while macpro-fand runs, and takes over
+ when macpro-fand stops cleanly or fails for good. Whenever neither governor
+ runs, every fan runs at full speed.

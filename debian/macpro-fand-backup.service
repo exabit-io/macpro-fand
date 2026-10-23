@@ -1,0 +1,11 @@
+# macpro-fand-backup.service -- installed by the macpro-fand package; started
+# only by macpro-fand.service's OnFailure= when macpro-fand fails for good.
+# Every fan to full speed, then the t2fanrd backup governor if it is installed;
+# without t2fanrd the fans stay at full speed.
+[Unit]
+Description=Mac Pro 7,1 fan failsafe after macpro-fand fails: full speed, then t2fanrd if installed
+Documentation=man:macpro-fand(8)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/macpro-fand/backup
