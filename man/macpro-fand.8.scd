@@ -11,6 +11,7 @@ macpro-fand - zone fan control and power budget for the Mac Pro 7,1
 *macpro-fand* *--release*++
 *macpro-fand* *--stopped*++
 *macpro-fand* *--check-config* [*--config* _file_]++
+*macpro-fand* *--inventory* [*--config* _file_]++
 *macpro-fand* *--version* | *--help*
 
 # DESCRIPTION
@@ -95,6 +96,41 @@ can be read. The fans are never put in the SMC's automatic
 mode, which has been seen holding every fan at its minimum regardless of GPU
 heat.
 
+## Sensor and fan I/O
+
+The control loop, which sends systemd's watchdog keepalive, reads no device:
+every sensor read and fan write runs in a thread of its own, and the loop
+works from their latest readings. A reading counts only while it is fresh;
+an older one is a failed read, and three failed reads in a row raise the
+alarm. One thread owns the fans: it writes the loop's settings at once, reads
+the tachometers and fan registers every 2 s, and puts back a fan another
+process changed. A second thread reads the CPU package and SMC temperatures
+every 2 s (fresh for 10 s); the GPU dies and the DC key have a thread each.
+Every peripheral sensor has its own thread and period: *nvme* every 5 s
+(fresh for 30 s), *drivetemp* every 30 s (fresh for 120 s; a disk temperature
+command can wait for a spin-up or an error recovery). A read that hangs
+therefore leaves only its own readings stale: the alarm follows and the fan
+thread still sets every fan to full speed. The fan thread checks a fan's
+registers against its setting no sooner than 1.5 s after writing it: the SMC
+shows a new setting in its registers 13-203 ms after the write (measured), and a
+check at once would mistake a ramping fan for another writer. The keepalive means "the loop runs
+and the fan thread makes progress": if the fan thread has not finished a round
+for 60 s, the loop withholds the keepalive and systemd's watchdog restart and
+failure path take over (every fan to full speed from the stop hook). Only the
+RAPL powercap registers (register reads, no device I/O), the override file
+and the journal are touched by the loop itself.
+
+Peripheral sensors are found again once a minute: a driver reload renumbers
+hwmon, and a driver installed later adds sensors. A sensor steers its fan from
+its first reading. One whose driver goes away (a reload, a device unbound for a
+virtual machine, an unloaded module) is retired, with a note, after 20 s,
+before its readings go stale, so no alarm; one that stops reading with its
+driver present raises the stale alarm and is retired after 600 s with nothing
+read (a failed drive). Either way its zone keeps the device's *UNMONITORED*
+floor, and the sensor comes back when it reads again. Slot cards whose driver gives the kernel no temperature can be
+read through *TEMP_COMMAND* (for example MFT's *mget_temp* for Mellanox
+cards); see *macpro-fand.conf*(5).
+
 ## Power budget
 
 Crossing the 1228 W DC envelope makes the SMC latch the GPU dies at 1000 MHz
@@ -115,9 +151,12 @@ row), the CPU is charged at PL2 as read back, and while the RAPL package zone is
 disabled or not enforcing, at 413 W, the top of PL1's range; the GPU dies make
 room. A GPU die in the hardware map whose power cap is not found within 240 s
 of start is charged at Vega 20's 200 W maximum, and every fan runs at full
-speed. Every uncapped device found at start that the calibration did not
-include (Mellanox network cards, NVMe drives other than the internal flash,
-rotational disks) adds its worst case to BASE.
+speed. Every uncapped peripheral found at start that the calibration did not
+include adds its class's worst case to BASE (*DEVICE_W* in
+*macpro-fand.conf*(5)): cards in the peripheral slots (Mellanox network cards,
+NVMe drives, switches on carrier cards, any other card) and disks (spinning,
+SSD, USB), classified by what each device reports about itself.
+*--inventory* lists them.
 
 The invariant is a model of sustained draw at those limits. K_GPU and K_CPU
 were calibrated at thermal equilibrium, and the GPU firmware and RAPL enforce
@@ -231,6 +270,12 @@ Override pins (below) suspend the ceilings.
 *--check-config*
 	Check the configuration file (all of it; see *macpro-fand.conf*(5)),
 	print the result and exit: 0 if it is valid, 78 if not.
+
+*--inventory*
+	Print, as one JSON line, the peripherals the power budget charges
+	(class, PCI slot or disk, fan, allowance), the resulting base, the
+	peripheral temperature sensors with the fan each one steers, and the
+	*UNMONITORED* floors; then exit. Needs no root and changes nothing.
 
 *--version*
 	Print the version and exit.

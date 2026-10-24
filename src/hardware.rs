@@ -7,7 +7,7 @@ use crate::{
     CAPS, RAPL,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -96,7 +96,7 @@ pub fn children(path: impl AsRef<Path>) -> Vec<PathBuf> {
     v.sort();
     v
 }
-fn named_children(path: impl AsRef<Path>, prefix: &str) -> Vec<PathBuf> {
+pub(crate) fn named_children(path: impl AsRef<Path>, prefix: &str) -> Vec<PathBuf> {
     children(path)
         .into_iter()
         .filter(|p| {
@@ -192,39 +192,6 @@ pub fn gpu_model_ok(paths: &Paths, addr: &str) -> bool {
         .is_some_and(|s| {
             s.len() == 6 && s.starts_with("0x66a") && s.as_bytes()[5].is_ascii_hexdigit()
         })
-}
-pub fn devices(paths: &Paths) -> BTreeMap<String, usize> {
-    let mlx: BTreeSet<_> = children(paths.sys("bus/pci/devices"))
-        .into_iter()
-        .filter(|d| {
-            text(d.join("vendor")).as_deref() == Some("0x15b3") && !d.join("physfn").exists()
-        })
-        .filter_map(|d| {
-            let s = d.file_name()?.to_str()?;
-            Some(s.get(..s.len().checked_sub(2)?)?.to_string())
-        })
-        .collect();
-    let nvme = named_children(paths.sys("class/nvme"), "nvme")
-        .iter()
-        .filter(|n| {
-            pci_chain(&n.join("device"))
-                .last()
-                .and_then(|a| text(paths.sys(&format!("bus/pci/devices/{a}/vendor"))))
-                .as_deref()
-                != Some("0x106b")
-        })
-        .count();
-    let disk = named_children(paths.sys("block"), "sd")
-        .iter()
-        .filter(|d| text(d.join("queue/rotational")).as_deref() == Some("1"))
-        .count();
-    [
-        ("mellanox".into(), mlx.len()),
-        ("nvme".into(), nvme),
-        ("disk".into(), disk),
-    ]
-    .into_iter()
-    .collect()
 }
 pub fn find_smc(paths: &Paths) -> Option<PathBuf> {
     let mut candidates = Vec::new();
@@ -426,49 +393,6 @@ impl Sensors {
                 ),
             );
         }
-        for (name, (target, band, default_crit)) in &c.periph {
-            for h in hwmon_named(paths, name) {
-                let input = h.join("temp1_input");
-                if !input.exists() {
-                    continue;
-                }
-                let pci = pci_chain(&h.join("device")).last().cloned();
-                let crit = number(h.join("temp1_crit"), 1000.0)
-                    .filter(|v| (50.0..=130.0).contains(v))
-                    .unwrap_or(*default_crit);
-                let internal = name == "nvme"
-                    && pci
-                        .as_ref()
-                        .and_then(|a| text(paths.sys(&format!("bus/pci/devices/{a}/vendor"))))
-                        .as_deref()
-                        == Some("0x106b");
-                let (key, spec) = if internal {
-                    let mut s = c.nvme.clone();
-                    s.emergency = crit - 5.0;
-                    ("nvme".into(), s)
-                } else {
-                    let zone = if name == "drivetemp" {
-                        c.disk_zone
-                    } else {
-                        pci_slot(paths, &h.join("device"))
-                            .and_then(|s| c.slot_zone.get(&s).copied())
-                            .unwrap_or(3)
-                    };
-                    let dev = fs::canonicalize(h.join("device")).unwrap_or_else(|_| h.clone());
-                    let basename = dev.file_name().unwrap_or_default().to_string_lossy();
-                    (
-                        format!("{name}:{basename}"),
-                        SensorSpec {
-                            fan: zone,
-                            target: *target,
-                            band: *band,
-                            emergency: crit - 5.0,
-                        },
-                    )
-                };
-                ambient.insert(key, (spec, Sensor::new(input, 1000.0, 10.0)));
-            }
-        }
         Ok(Self {
             cpu,
             cpu_crit,
@@ -517,7 +441,7 @@ pub fn cap_paths(paths: &Paths, c: &Config) -> (BTreeMap<String, String>, Vec<St
     }
     (found, missing)
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Fans {
     pub smc: PathBuf,
 }
@@ -684,8 +608,6 @@ pub(crate) mod tests {
         put(p.sys("block/sda/queue/rotational"), "1");
         put(p.sys("block/sdb/queue/rotational"), "0");
         assert_eq!(die_map(&p, &Config::default()).len(), 2);
-        assert_eq!(devices(&p)["mellanox"], 1);
-        assert_eq!(devices(&p)["disk"], 1);
         assert_eq!(rapl_state(&p), (false, false));
         put(p.resolve(RAPL).join("enabled"), "1");
         put(p.resolve(RAPL).join("constraint_0_name"), "long_term");

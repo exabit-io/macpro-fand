@@ -20,7 +20,7 @@ atcaps() { [ "$(outs)" = "$CAPS" ] && [ "$(mans)" = 1111 ]; }
 # after a (re)start the daemon writes its zone start values, then applies the override on its first pass: wait for it
 waitcaps() { local end=$((SECONDS + ${1:-30})); while [ $SECONDS -lt $end ]; do atcaps && return 0; sleep 1; done; return 1; }
 ver=$(dpkg-query -W -f='${Version}' macpro-fand 2>/dev/null)
-[ "$ver" = 2.0.1 ] || { echo "installed macpro-fand is $ver, not 2.0.1; not testing"; exit 2; }
+dpkg --compare-versions "$ver" ge 2.0.1 2>/dev/null || { echo "installed macpro-fand is $ver, not 2.0.1 or later; not testing"; exit 2; }
 systemctl cat t2fanrd.service >/dev/null 2>&1 || { echo "t2fanrd is not installed; not testing"; exit 2; }
 T2CSAVE=$(mktemp); cp -p $T2C "$T2CSAVE"; OVSAVE=$(cat $OV 2>/dev/null); T2EN=$(systemctl is-enabled t2fanrd 2>/dev/null)
 restore() {

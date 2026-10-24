@@ -12,7 +12,7 @@ pub struct Zone {
     pub floor: f64,
     pub init: f64,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SensorSpec {
     pub fan: usize,
     pub target: f64,
@@ -48,6 +48,11 @@ pub struct Config {
     pub nvme: SensorSpec,
     pub periph: BTreeMap<String, (f64, f64, f64)>,
     pub device_w: BTreeMap<String, f64>,
+    pub device_pci_w: BTreeMap<String, f64>,
+    /// Per device class: a floor, rpm, and optionally a fan whose speed the zone fan must not run below.
+    pub unmonitored: BTreeMap<String, (f64, Option<usize>)>,
+    pub periph_poll: BTreeMap<String, (f64, f64)>,
+    pub temp_command: BTreeMap<String, Vec<String>>,
     pub slot_zone: BTreeMap<String, usize>,
     pub disk_zone: usize,
     pub dies: BTreeMap<String, usize>,
@@ -65,9 +70,14 @@ fn defaults() -> BTreeMap<String, Value> {
       'GPU_CAP': {'floor': 85, 'max': 200, 'init': 125}, 'CPU_PL1': {'floor':80, 'max':413},
       'STATIC_SAFE': {'gpu':125, 'pl1':None}, 'CPU_KEEP': (1.2,20), 'T_WORK': (65,1),
       'HBM_WORK': 80, 'BACKSTOP':1190, 'SMC': {'TPCD':(2,45.7,90,1)}, 'NVME': (1,55,1),
-      'DEVICE_W': {'mellanox':25,'nvme':9,'disk':25}, 'SLOT_ZONE': {'5':3,'6':3,'7':3,'8':3},
-      'PERIPH': {'nvme':(60,1,80),'mlx5':(80,1,105),'drivetemp':(40,1,60)},
-      'DISK_ZONE':3,'DIES':{},'MPX_BAY':{'1':1,'2':1,'3':2,'4':2}
+      'DEVICE_W': {'mellanox':25,'nvme':25,'nvme-switched':9,'pcie-switch':10,'pcie-card':25,
+                   'disk':25,'ssd':8,'usb-disk':10},
+      'DEVICE_PCI_W': {}, 'UNMONITORED': {'mellanox':(1000,4),'pcie-card':(1000,4)},
+      'SLOT_ZONE': {'5':3,'6':3,'7':3},
+      'PERIPH': {'nvme':(60,1,80),'mlx5':(80,1,105),'drivetemp':(40,1,60),'mellanox':(80,1,105)},
+      'PERIPH_POLL': {'nvme':(5,30),'mlx5':(5,30),'drivetemp':(30,120),'mellanox':(15,60)},
+      'TEMP_COMMAND': {},
+      'DISK_ZONE':4,'DIES':{},'MPX_BAY':{'1':1,'2':1,'3':2,'4':2}
     }"#;
     let mut values: BTreeMap<_, _> = literal::parse(source)
         .expect("built-in config literal")
@@ -264,6 +274,63 @@ impl Config {
                 return Err(format!("DEVICE_W missing {k}"));
             }
         }
+        let mut device_pci_w = BTreeMap::new();
+        for (k, v) in dict(val("DEVICE_PCI_W"), "DEVICE_PCI_W")? {
+            let id = string(k, "DEVICE_PCI_W key")?.to_ascii_lowercase();
+            let b = id.as_bytes();
+            if b.len() != 9
+                || b[4] != b':'
+                || !id
+                    .chars()
+                    .filter(|c| *c != ':')
+                    .all(|c| c.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "DEVICE_PCI_W key {id:?} must be a PCI id 'vvvv:dddd'"
+                ));
+            }
+            device_pci_w.insert(id, num(v, 0.0, 500.0, "DEVICE_PCI_W")?);
+        }
+        let mut unmonitored = BTreeMap::new();
+        for (k, v) in dict(val("UNMONITORED"), "UNMONITORED")? {
+            let entry = match v {
+                Value::Tuple(t) if t.len() == 2 => (
+                    num(&t[0], 0.0, CAPS[1], "UNMONITORED rpm")?,
+                    Some(fan(&t[1], "UNMONITORED fan")?),
+                ),
+                _ => (num(v, 0.0, CAPS[1], "UNMONITORED rpm")?, None),
+            };
+            unmonitored.insert(string(k, "UNMONITORED key")?, entry);
+        }
+        let mut periph_poll = BTreeMap::new();
+        for (k, v) in dict(val("PERIPH_POLL"), "PERIPH_POLL")? {
+            let t = tuple(v, 2, "PERIPH_POLL entry")?;
+            let period = num(&t[0], 1.0, 300.0, "PERIPH_POLL period")?;
+            let stale = num(
+                &t[1],
+                2.0 * period,
+                3600.0,
+                "PERIPH_POLL stale (at least two periods)",
+            )?;
+            periph_poll.insert(string(k, "PERIPH_POLL key")?, (period, stale));
+        }
+        let mut temp_command = BTreeMap::new();
+        for (k, v) in dict(val("TEMP_COMMAND"), "TEMP_COMMAND")? {
+            let items = match v {
+                Value::Tuple(i) | Value::List(i) if !i.is_empty() && i.len() <= 16 => i,
+                _ => {
+                    return Err("TEMP_COMMAND entry must be a non-empty sequence of strings".into())
+                }
+            };
+            let argv = items
+                .iter()
+                .map(|a| string(a, "TEMP_COMMAND argument"))
+                .collect::<Result<Vec<_>, _>>()?;
+            if !argv[0].starts_with('/') {
+                return Err("TEMP_COMMAND program must be an absolute path".into());
+            }
+            temp_command.insert(string(k, "TEMP_COMMAND key")?, argv);
+        }
         let mut slot_zone = BTreeMap::new();
         for (k, v) in dict(val("SLOT_ZONE"), "SLOT_ZONE")? {
             slot_zone.insert(string(k, "SLOT_ZONE key")?, fan(v, "SLOT_ZONE fan")?);
@@ -295,6 +362,10 @@ impl Config {
             nvme,
             periph,
             device_w,
+            device_pci_w,
+            unmonitored,
+            periph_poll,
+            temp_command,
             slot_zone,
             dies: bays("DIES")?,
             mpx_bay: bays("MPX_BAY")?,
@@ -375,17 +446,18 @@ impl Config {
         }
         Self::from_values(&values)
     }
-    pub fn fixed_base(&self, devices: &BTreeMap<String, usize>) -> f64 {
-        self.base
-            + devices
-                .iter()
-                .map(|(k, n)| self.device_w.get(k).copied().unwrap_or(0.0) * *n as f64)
-                .sum::<f64>()
+    /// The measured base plus every peripheral's allowance.
+    pub fn fixed_base(&self, devices: &[crate::inventory::Device]) -> f64 {
+        self.base + devices.iter().map(|d| d.watts).sum::<f64>()
+    }
+    /// Poll period and staleness limit (s) for a peripheral sensor class.
+    pub fn poll(&self, class: &str) -> (f64, f64) {
+        self.periph_poll.get(class).copied().unwrap_or((5.0, 30.0))
     }
     pub fn check_feasible(
         &self,
         discovered_dies: usize,
-        devices: &BTreeMap<String, usize>,
+        devices: &[crate::inventory::Device],
     ) -> Result<(), String> {
         let n = if self.dies.is_empty() {
             discovered_dies
@@ -555,9 +627,7 @@ mod tests {
         assert_eq!(c.zones[3].init, 500.0);
         assert_eq!(c.smc.len(), 13);
         assert_eq!(c.device_w["disk"], 25.0);
-        assert!(Config::default()
-            .check_feasible(4, &BTreeMap::new())
-            .is_ok());
+        assert!(Config::default().check_feasible(4, &[]).is_ok());
     }
     #[test]
     fn rejects_unsafe_shapes_without_panicking() {
@@ -581,9 +651,7 @@ mod tests {
         ] {
             assert!(Config::from_text(text).is_err(), "accepted {text}");
         }
-        assert!(Config::default()
-            .check_feasible(50, &BTreeMap::new())
-            .is_err());
+        assert!(Config::default().check_feasible(50, &[]).is_err());
     }
     #[test]
     fn override_nan_ttl_and_pins() {

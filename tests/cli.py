@@ -17,8 +17,12 @@ def check(args, code, part):
     checks += 1
 
 
-check(["--version"], 0, "macpro-fand 2.0.1")
+import re
+version = re.search(r'^version = "([^"]+)"', (pathlib.Path(__file__).resolve().parents[1] / "Cargo.toml").read_text(), re.M)[1]
+check(["--version"], 0, f"macpro-fand {version}")
 check(["--help"], 0, "--stopped")
+check(["--help"], 0, "--inventory")
+check(["--inventory", "--check-config"], 2, "select only one")
 check(["--dry-run", "--release"], 2, "select only one")
 check(["--config"], 2, "needs a path")
 check(["--unknown"], 2, "unknown option")
@@ -29,6 +33,13 @@ with tempfile.TemporaryDirectory(prefix="macpro-fand-cli-") as tmp:
         config.write_bytes(text)
         check(["--check-config", "--config", str(config)], 78, "configuration")
         check(["--dry-run", f"--config={config}"], 78, "configuration")
+        check(["--inventory", f"--config={config}"], 78, "configuration")
+    config.write_text("UNMONITORED = {'mellanox': (900, 4)}\nTEMP_COMMAND = {'mellanox': ('/nonexistent/mget_temp', '-d', '{pci}')}\n")
+    check(["--inventory", f"--config={config}"], 0, '"budget_base"')
+    for text in ["UNMONITORED = {'x': (900, 5)}", "TEMP_COMMAND = {'x': ('relative',)}", "DEVICE_PCI_W = {'15b3': 1}",
+                 "PERIPH_POLL = {'nvme': (10, 15)}"]:
+        config.write_text(text)
+        check(["--check-config", "--config", str(config)], 78, "configuration")
     import os
     config.unlink()
     os.mkfifo(config)

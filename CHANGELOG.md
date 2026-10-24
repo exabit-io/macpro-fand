@@ -1,5 +1,55 @@
 # Changelog
 
+## 2.0.2
+
+Peripheral support (slot cards, SATA/USB disks) and sensor I/O off the control thread.
+
+- **No device I/O on the watchdog thread.** On 2026-10-22 the control loop blocked for more than 20 s in one sysfs
+  read and systemd's watchdog killed the daemon. Every sensor read and fan write now runs in its own thread: one for
+  the fans (settings written at once, tachometers and fan registers every 2 s, a changed fan put back), one for the
+  CPU package and SMC temperatures, one per peripheral sensor, beside the existing GPU and DC samplers. Stale
+  readings are failed reads (alarm: every fan to its cap), so a hung temperature read raises the alarm and the fan
+  thread still writes the caps. A fan's registers are checked 1.5 s or more after it was written (the SMC shows a
+  write in its registers 13-203 ms later, measured; a check at once made a ramping fan look changed by another
+  writer). The keepalive needs the fan thread's progress: after 60 s without a fan round the
+  loop withholds it and the watchdog's restart and failure path take over. Measured on the box: a disk temperature
+  read issued during an HDD spin-up blocks for 2.7 s, and a drive in error recovery can hold one for 30 s or more.
+- **Per-device power allowances.** The budget charges each peripheral by class (`DEVICE_W`: mellanox, nvme,
+  nvme-switched, pcie-switch, pcie-card, disk, ssd, usb-disk), or by PCI id (`DEVICE_PCI_W`). Disks are classified by
+  the rotation rate they report (SCSI VPD B1), never by the kernel's `rotational` flag for USB disks: 2.0.1 charged a
+  USB-attached SATA SSD as a 25 W spinning disk. Only cards in `SLOT_ZONE` slots are peripherals; an NVMe drive
+  directly in a slot is now charged 25 W (the drive's own maximum power state on the Samsung PM1725), 9 W behind a
+  switch on an M.2 carrier.
+- **Peripheral sensors:** one reader thread each, with a period and staleness limit per class (`PERIPH_POLL`:
+  drivetemp every 30 s, NVMe every 5 s); rediscovered once a minute (driver reloads renumber hwmon); a sensor steers
+  its fan from its first reading; one whose driver is gone for 20 s (before it goes stale: a driver reload raises no
+  alarm) or that reads nothing for 600 s is retired to its
+  device's `UNMONITORED` floor instead of a permanent alarm, and comes back when it reads again. USB and Thunderbolt
+  devices are not cooled by the box's fans and steer none.
+- **`TEMP_COMMAND`** (opt-in): a program that prints a slot card's temperature, for cards whose driver exposes no
+  hwmon, e.g. MFT's `mget_temp -d {pci}` for ConnectX-4 cards; run on its own thread with a deadline.
+- **`UNMONITORED`:** a zone floor for devices with no live temperature sensor: an rpm, or `(rpm, fan)` to also follow
+  another fan. Default for Mellanox and other cards `(1000, 4)`: the zone test (below) found the top fan heating the
+  slot-5/6 cards, by about 60 % of what the middle fan removes once settled and more in a state that had not settled.
+- **Zone test with the peripherals (2026-10-23)**, one fan +600 rpm at a time to thermal equilibrium, drift-corrected
+  between bracketing baselines: middle fan -5.3 / -5.2 / -4.0 °C on the slot 5 / 6 / 7 cards; top fan -2.7 / -3.0 °C on
+  the internal-bay HDDs and +3.2 / +2.9 °C on the slot 5 / 6 cards (settled; a later step to +6.2 / +4.3 °C had not
+  settled when the point ended: the NIC readings were logged beside the test, not gated by it); bottom fan at most
+  -1.4 °C on any of them. Rerun with the cards cabled and their temperatures gated: the top fan +600 alone left them
+  wandering +4 to +9 °C for 100 minutes without settling; with the middle fan +600 as well they settled -7.1 / -7.3 °C
+  and the HDDs kept their -3 °C. A sustained PM1725 write (+9.3 W on the slot rail) at the base fans: PM1725 +13 °C,
+  slot 6 card +1.7 °C, slot 5 card 0; with the middle fan +600, -8.0 / -7.2 °C on the cards.
+- **`--inventory`:** prints the charged peripherals, the budget base and the peripheral sensors (JSON).
+- Defaults: `DISK_ZONE` 4 (the internal drive bay sits in the top fan's zone), `SLOT_ZONE` without slot 8 (the Apple
+  I/O card).
+- **One apt source for every release:** the rolling channel
+  `https://github.com/exabit-io/macpro-fand/releases/download/apt` holds every published version, so new releases
+  arrive with `apt update && apt upgrade`. Until 2.0.1 each release was a separate repository and the source line had
+  to be edited for every upgrade; replace it with the channel line in the README once.
+- Hardware tests: the 2.0.1 fail-safe tests are T24/T25 (T13/T14 were numbered twice); GPU dies are found by bus
+  (adding a slot-5 card moved them); T26-T31 for the inventory, both thread stalls, a driver unloaded and loaded,
+  `TEMP_COMMAND` and the `UNMONITORED` floor.
+
 ## 2.0.1
 
 systemd integration and packaging only; the daemon's code is unchanged.

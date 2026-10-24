@@ -1,3 +1,26 @@
+macpro-fand (2.0.2) unstable; urgency=medium
+
+  * Sensor and fan I/O off the control thread (the 2026-10-22 watchdog
+    outage): a fan thread (settings, tachometers, fan registers), a
+    temperature thread, one reader thread per peripheral sensor; stale
+    readings are failed reads; the keepalive needs the fan thread's progress
+    (withheld after 60 s).
+  * Per-device peripheral inventory: DEVICE_W classes mellanox, nvme,
+    nvme-switched, pcie-switch, pcie-card, disk, ssd, usb-disk, and
+    DEVICE_PCI_W by PCI id; disks classified by their own rotation rate
+    (VPD B1), not the rotational flag of USB storage.
+  * Peripheral sensors rediscovered every minute, PERIPH_POLL periods,
+    first-reading arming, retirement to the UNMONITORED floor.
+  * New settings TEMP_COMMAND (opt-in, e.g. MFT mget_temp for Mellanox) and
+    UNMONITORED; new option --inventory.
+  * Defaults from the 2026-10-23 zone test: DISK_ZONE 4, SLOT_ZONE 5-7 on
+    fan 3, UNMONITORED mellanox/pcie-card (1000, 4): 1000 rpm and never
+    below fan 4 (zone rerun with the cards cabled, 2026-10-23/24).
+  * Hardware tests: GPU dies found by bus, the 2.0.1 fail-safe tests
+    renumbered T24/T25, new T26-T31.
+
+ -- Exabit Networks <packages@exabit.io>  Sat, 24 Oct 2026 18:30:14 +0000
+
 macpro-fand (2.0.1) unstable; urgency=medium
 
   * macpro-fand takes priority over t2fanrd, which becomes an optional

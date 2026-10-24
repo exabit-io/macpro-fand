@@ -1,0 +1,13 @@
+start 2026-10-24T18:33:17Z kernel #38~24.04.4+barfix4 SMP PREEMPT_DYNAMIC Fri Oct 23 01:52:49 UTC ; installed 2.0.2 sha256 be3ef504445fd66c41ed3af07504f124ef02167ff82aaef38bdf05ca41724431
+PASS  F1 installed: macpro-fand owner, t2fanrd off at boot, drop-in loaded, no Conflicts
+PASS  F2 t2fanrd start beside macpro-fand refused; macpro-fand untouched (pid 262543)
+PASS  F3 restart window (activating auto-restart ): t2fanrd refused, macpro-fand back
+PASS  F4 clean stop -> t2fanrd
+PASS  F5 start stops t2fanrd first; macpro-fand in charge
+PASS  F6 permanent failure -> backup: full speed, t2fanrd started
+PASS  F6b next start takes the fans back from t2fanrd
+PASS  F7 t2fanrd stop with no owner -> full speed (curve was 500 500 500 500 )
+PASS  F8 no t2fanrd: permanent failure -> full speed, nothing else
+restored: macpro-fand active, t2fanrd inactive/disabled, override '', fans 600 1150 1125 500 
+end: 9 passed, 0 failed
+exit 0 at 2026-10-24T18:34:29Z

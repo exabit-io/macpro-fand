@@ -3,10 +3,12 @@ pub mod budget;
 pub mod config;
 pub mod control;
 pub mod hardware;
+pub mod inventory;
 pub mod literal;
 pub mod os;
 pub mod power;
 pub mod runtime;
+pub mod sampling;
 pub mod transaction;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

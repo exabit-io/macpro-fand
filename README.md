@@ -88,21 +88,24 @@ and `intel-rapl`.
 
 ## Install
 
-From the Exabit apt repository (Ubuntu 24.04, x86-64):
+From the Exabit apt repository (Ubuntu 24.04, x86-64). The source line names the rolling channel, which holds every
+release, so later releases arrive with `sudo apt update && sudo apt upgrade`:
 
 ```sh
 sudo install -d -m 755 /etc/apt/keyrings
 curl -fsSL https://exabit-io.github.io/resize-amdgpu-bars/keys/resize-amdgpu-bars.gpg \
     | sudo tee /etc/apt/keyrings/resize-amdgpu-bars.gpg > /dev/null
-echo 'deb [signed-by=/etc/apt/keyrings/resize-amdgpu-bars.gpg] https://github.com/exabit-io/macpro-fand/releases/download/macpro-fand-2.0.1 ./' \
+echo 'deb [signed-by=/etc/apt/keyrings/resize-amdgpu-bars.gpg] https://github.com/exabit-io/macpro-fand/releases/download/apt ./' \
     | sudo tee /etc/apt/sources.list.d/macpro-fand.list
 sudo apt update
 sudo apt install macpro-fand
 ```
 
-Each release is its own signed flat apt repository, tagged on the source commit it was built from:
-https://github.com/exabit-io/macpro-fand/releases. To go back to 1.0.6, point the source line at `macpro-fand-1.0.6` and
-`sudo apt install --allow-downgrades macpro-fand=1.0.6`.
+The channel (the release named `apt`) is a signed flat apt repository holding every published version. Each version
+is also a release of its own, tagged on the source commit it was built from, with its notes:
+https://github.com/exabit-io/macpro-fand/releases. A machine set up with a per-release source line
+(`.../releases/download/macpro-fand-2.0.1 ./`, before 2.0.2) needs that line replaced by the one above, once. To go
+back to an earlier version: `sudo apt install --allow-downgrades macpro-fand=2.0.1` (or `=1.0.6`).
 
 See [the engineering handoff](docs/v2-handoff.md) for architecture, compatibility differences, verification evidence
 and the hardware qualification procedure. The original daemon and its tests are retained under

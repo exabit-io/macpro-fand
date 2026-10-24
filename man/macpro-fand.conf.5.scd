@@ -78,16 +78,63 @@ the middle front fan (MPX bay 2 and PCIe slots 5-8), *4* the top front fan
 	temperature less 5 °C.
 
 *PERIPH*
-	Devices beyond the stock machine, by hwmon driver name: *(target,
-	band, critical)*, used when the device reports no critical temperature.
-	Defaults: *nvme* (60, 1, 80), *mlx5* (80, 1, 105), *drivetemp* (40, 1, 60).
+	Devices beyond the stock machine, by hwmon driver name (or *TEMP_COMMAND*
+	class): *(target, band, critical)*; the critical temperature is used when
+	the device reports none, and the emergency is 5 °C below it. Defaults:
+	*nvme* (60, 1, 80), *mlx5* (80, 1, 105), *drivetemp* (40, 1, 60),
+	*mellanox* (80, 1, 105). Only devices in a *SLOT_ZONE* slot or on an
+	internal SATA port steer a fan; USB and Thunderbolt devices are not
+	cooled by the box's fans and are left out.
 
-*SLOT_ZONE* = _{"5": 3, "6": 3, "7": 3, "8": 3}_
-	The fan for a device in each PCI slot.
+*PERIPH_POLL*
+	Read period and staleness limit, s, per sensor class: *(period, stale)*,
+	stale at least two periods. Defaults: *nvme* (5, 30), *mlx5* (5, 30),
+	*drivetemp* (30, 120), *mellanox* (15, 60); any other class (5, 30). Each
+	sensor has its own reader thread, so a drive that holds a temperature
+	command (spin-up, error recovery) only makes its own reading stale. A
+	reading older than its limit counts as a failed read (alarm: every fan
+	to its cap). A sensor counts only from its first reading. One that
+	stops reading is retired, with a note, when its driver has been gone
+	for 20 s (before its readings go stale: a driver reload raises no
+	alarm) or it has read nothing for 600 s; its zone then keeps the
+	device's *UNMONITORED* floor. A retired sensor that reads again comes
+	back. Sensors are rediscovered once a minute (driver reloads renumber
+	hwmon).
 
-*DISK_ZONE* = _3_
-	The fan for SATA disks (*drivetemp*; loaded automatically when a
-	rotational disk is present).
+*TEMP_COMMAND* = _{}_
+	A program that prints a device's temperature, °C, for slot cards whose
+	driver gives the kernel no sensor, by *DEVICE_W* class: a tuple of
+	strings, the program an absolute path, *{pci}* replaced by the card's
+	function-0 PCI address. It runs on the sensor's own thread every
+	*PERIPH_POLL* period, killed at that period (at most 10 s); the first
+	number on its standard output is the reading. A program that does not
+	exist at start adds nothing. For Mellanox cards with MFT installed:
+	*TEMP_COMMAND = {"mellanox": ("/usr/bin/mget_temp", "-d", "{pci}")}*.
+
+*UNMONITORED* = _{"mellanox": (1000, 4), "pcie-card": (1000, 4)}_
+	A floor for the fan of a device's zone while the device has no live
+	temperature sensor, by *DEVICE_W* class (a card with no hwmon and no
+	*TEMP_COMMAND*, or a retired sensor): an rpm, or *(rpm, fan)*, the zone
+	fan then also never slower than that fan. Automatic mode only. The
+	default comes from ConnectX-4 cards in slots 5 and 6 at idle
+	(2026-10-23, one fan raised 600 rpm at a time to thermal equilibrium):
+	42.5 °C at 1150 rpm of the middle fan uncabled, 53.4 °C with both
+	InfiniBand links up and no traffic, 5.3 °C (uncabled) to 8 °C cooler
+	at 1750, following 1/airflow, which at the middle fan's 500 rpm floor
+	predicts about 68 °C idle uncabled and over 90 °C under traffic. No
+	baffle separates the top fan's air from the slots: 600 rpm more on the
+	top fan alone left the cabled cards wandering 4 to 9 °C hotter for 100
+	minutes without settling, and with the middle fan raised as well they
+	settled 7 °C cooler. So the middle fan follows the top fan.
+
+*SLOT_ZONE* = _{"5": 3, "6": 3, "7": 3}_
+	The fan for a device in each PCI slot. Only these slots hold
+	peripherals: devices elsewhere are neither charged to the budget nor
+	governed (slot 8 is the Apple I/O card, slots 1-4 the MPX bays).
+
+*DISK_ZONE* = _4_
+	The fan for internal SATA disks (*drivetemp*; loaded automatically when
+	a SATA disk is present).
 
 # POWER BUDGET
 
@@ -99,9 +146,22 @@ the middle front fan (MPX bay 2 and PCIe slots 5-8), *4* the top front fan
 	K_CPU × PL1. BASE is the machine with every fan at full speed plus an
 	allowance for memory and storage traffic.
 
-*DEVICE_W* = _{"mellanox": 25.0, "nvme": 9.0, "disk": 25.0}_
-	Worst case added to BASE for each Mellanox card, NVMe drive (other than
-	the internal flash) and rotational disk found at start.
+*DEVICE_W*
+	Worst case added to BASE for each peripheral found at start, W, by class:
+	*mellanox* 25 (a Mellanox card, both ports), *nvme* 25 (an NVMe drive
+	directly in a slot), *nvme-switched* 9 (an NVMe drive behind a switch on a
+	carrier card, M.2), *pcie-switch* 10 (a switch on a card), *pcie-card* 25
+	(any other card in a *SLOT_ZONE* slot), *disk* 25 (a spinning disk,
+	spin-up included), *ssd* 8 (a SATA/SAS SSD), *usb-disk* 10 (a USB disk
+	that reports no rotation rate). A disk is a spinning disk or an SSD by the
+	rotation rate it reports itself (SCSI VPD page B1); the kernel's
+	*rotational* flag is used only when it reports none, and never for USB
+	disks, which the kernel marks rotational whatever they are.
+	*macpro-fand --inventory* lists what is found and charged.
+
+*DEVICE_PCI_W* = _{}_
+	An allowance, W, by PCI id *"vvvv:dddd"* (lower-case hex), in place of the
+	class's *DEVICE_W* for every card with that id.
 
 *GPU_CAP* = _{"floor": 85, "max": 200, "init": 125}_
 	Range of a GPU die's cap and its default share, W; the built-in

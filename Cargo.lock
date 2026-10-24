@@ -4,4 +4,4 @@ version = 3
 
 [[package]]
 name = "macpro-fand"
-version = "2.0.1"
+version = "2.0.2"

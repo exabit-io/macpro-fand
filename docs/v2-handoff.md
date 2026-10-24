@@ -29,6 +29,8 @@ from different directories give identical files).
 | `src/transaction.rs` | Read/decrease/stage/raise transaction, read-back verification, CPU write ordering |
 | `src/power.rs` | Single writer, generations, reconciliation, per-read timestamps, bounded quiescence and recovery |
 | `src/hardware.rs` | Discovery, sysfs adapters, GPU sampler, SMC key sampler, fan writes |
+| `src/inventory.rs` | 2.0.2: peripheral inventory (classes, slots, allowances), peripheral and command sensors, `UNMONITORED` floors |
+| `src/sampling.rs` | 2.0.2: fan thread, platform temperature thread, per-sensor reader threads, sensor rescan |
 | `src/os.rs` | Linux locks and signals, bounded child commands, systemd notifications and service queries |
 | `src/runtime.rs` | CLI, sensor/alarm policy, ownership, startup, control loop, stop hook and cleanup |
 
@@ -186,3 +188,98 @@ both sampler threads slept in 50 ms slices to poll their stop flags, 60 wakeups 
 samplers now sleep on a condition variable that a stop wakes at once, and the control loop checks the
 signal-handler flag every 500 ms (1.0.6 checked it every 2 s). That change is the only difference between the two
 qualified executables.
+
+## 2.0.2: peripherals and sensor I/O off the control thread
+
+**Why.** On 2026-10-22 the control loop blocked for more than 20 s in one sysfs read (the Rust standard library's
+32-byte probe read of an SMC/hwmon attribute) and systemd's watchdog killed the daemon. The peripherals installed on
+2026-10-23 (two ConnectX-4 cards, a PM1725 NVMe card, two SATA HDDs and a USB-attached SATA SSD in a Sonnet Fusion Flex
+J3i) add sensors whose reads are device commands: a drivetemp read issued during an HDD spin-up blocked 2.7 s on the
+box, and a drive in error recovery can hold a command for 30 s or more.
+
+**Threads.** The control loop (the watchdog keepalive) reads no device. `sampling::Platform` runs a fan thread (the
+loop's settings written at once on a kick, tachometers and fan registers every 2 s, a fan another writer changed put
+back) and a temperature thread (CPU package and SMC keys every 2 s); `DeviceReader` runs one thread per peripheral
+sensor at its class's period (`PERIPH_POLL`); `Scanner` rediscovers peripheral sensors once a minute. The loop treats
+readings older than their staleness limit as failed reads, so the alarm semantics are unchanged. The keepalive is
+sent only while the fan thread completed a round within `IO_STALL` (60 s); a longer stall goes to the watchdog's
+restart and failure path. The fan thread checks each fan's registers first and writes new settings after, and
+skips a fan written less than `VERIFY_SETTLE` (1.5 s) ago: the SMC shows a write in its registers 13-203 ms later
+(measured 2026-10-23), and the first hardware run, which checked straight after writing, raised false
+"changed by another writer" alarms while the bay fans ramped under a GPU burn (T21/T22). Cleanup freezes the fan thread (under its write lock) before writing the caps, so no
+thread write lands after them. What stays on the loop: RAPL powercap registers (MSR reads), the override file on
+tmpfs, the journal.
+
+**Peripheral sensors.** A sensor is armed by its first reading (one that never reads leaves its device unmonitored,
+with a note after 60 s, instead of alarming); a sensor that read and stops goes stale (alarm); it is retired to the
+device's `UNMONITORED` floor when its driver has been gone 20 s (before it goes stale, so a driver reload raises no
+alarm) or it has read nothing for 600 s; a retired sensor
+that reads again comes back. Sensors of USB and Thunderbolt devices steer no fan. `TEMP_COMMAND` runs a program for
+cards with no hwmon (MFT `mget_temp` for ConnectX-4: no mlx5 hwmon on firmware 12.28 / 14.20), with a deadline of one
+period (at most 10 s).
+
+**Inventory.** `inventory::devices` charges every PCI function-0 endpoint (no VFs, no AMD) below a `SLOT_ZONE` slot
+port, a card's switch once at its upstream port, and every SCSI disk; disks by the rotation rate they report (VPD B1),
+the kernel's `rotational` flag only when there is none and never for USB disks. `DEVICE_PCI_W` overrides a class by
+PCI id. `--inventory` prints all of it.
+
+**Measurements (2026-10-23).** Zone test, one fan +600 rpm (blower +470) at a
+time from 730/1150/1150/1150, every point at thermal equilibrium on its gated signals, effects interpolated between
+bracketing baselines (`zone-test.py`, `zone-analysis.py`, run `zone-20261023-0503`; the blower point reached its cap:
+the PM1725's 1 °C reading stepped once inside the trend window): middle fan -5.3 / -5.2 / -4.0 °C on the slot 5 / 6 / 7
+cards; top fan -2.7 / -3.0 °C on the J3i HDDs and +3.2 / +2.9 °C on the slot 5 / 6 cards; bottom fan at most -1.4 °C on
+any peripheral. The NIC temperatures (`mget_temp`, logged beside the test by `nic-temp-log.sh`, not in its gate) settled
+within minutes of the fan 4 step and returned within minutes of the next point, while the CPU heatsink sensors
+(TC0P-TC3P) took about 25 minutes, so the effect follows fan 4's airflow, not heat stored in the heatsink. No baffle
+stops the top fan's air leaving through the auxiliary slot brackets in the middle fan's line, or the middle fan's air
+leaving through the 3.5" bay, so a pressure difference between the two fans moves air across zones: the follow rule (fan
+3 never slower than fan 4 while a card has no sensor) removes the difference that pushes the top lane into the slots.
+The test ran idle (slot rail at most 51.3 W, no I/O): the slot 5-8 bracket vents pass little air, so a busy PM1725 or
+NIC heats its neighbours by recirculation in the slot bay, and the half-height cards do not separate the zones the way
+the full-height slot 8 I/O card does. NIC temperatures under that load are not measured. 36 minutes in, a second step
+(+6.2 / +4.3 °C; the bay 2 GPU module +0.7-1 °C at the same moment, the CPU 0.5 °C cooler, bay 2 power +0.1 W) had held
+15 minutes when the point qualified, so the matrix's +6.2 / +4.3 is not an equilibrium value; `zone-test.py` now gates
+the cards when MFT is present. The HDD result was gated (30-minute trend window, with the heatsink sensors inside the
+gate's 0.2 °C per 5 minutes). Hence `SLOT_ZONE` 5-7 -> fan 3, `DISK_ZONE` 4, `UNMONITORED` mellanox/pcie-card `(1000,
+4)`. Power (`periph-power.py`, run `power-20261023-1222`, fans held 730/1500/1500/1500, increments bracketed by idle
+windows): the three cards idle at 33.4 W together (SMC PZ5G 17.1 -> 50.5 W); the PM1725 adds at most +9.1 W on the slot
+rail (sequential read); each HDD idles at 9.2 W (standby saves 18.3 W for both) and adds +6.6 W writing; a spin-up is
+invisible at the SMC's 1 Hz. The class allowances (125 W for these six devices) cover the measured ~75 W (before NIC
+traffic) with margin.
+
+**Rerun (2026-10-23 18:16 to 10-24 02:01, `PLAN=rerun`, run `zone-20261023-1816`, NIC temperatures gated).** The cards
+had been cabled at 16:39-16:41 (kernel log): the VPI card's two InfiniBand ports physically up (INIT, no subnet manager,
+no traffic), the Lx port down. That raised the idle base at 730/1150/1150/1150 to 53.4 / 49.2 °C on the slot 5 / 6 cards
+and the slot rail to 56.9 W (50.5 W uncabled), steady across the three baselines. Top fan +600 alone (`f4`): the cards
+never settled in 100 minutes (cap 6000 s), their 5-minute means wandering 57-63 / 52-57 °C, +4 to +9 °C; the morning's
+"second step" was this wandering, not a second state. HDDs -3.0 °C, PM1725 0. Top and middle fans both +600 (`f34`):
+settled cleanly at -7.1 / -7.3 °C on the cards, HDDs still -3.0 °C, PM1725 -4.0 °C, bay 2 dies -3.0 °C: with no
+difference between the two fans the cross-zone heating and the instability both go, and the HDDs keep the top fan's
+cooling. PM1725 under a sustained sequential write (fio 128k QD32 x4, 1.7 GB/s; +9.3 W slot rail, +33 W DC with the host
+side) at the base fans (`pm`): PM1725 +13.0 °C, slot 6 card (next to slot 7) +1.7 °C, slot 5 card 0.0 °C, CPU heatsink
++2.3 °C; with the middle fan +600 (`pm-f3`): PM1725 +6.0 °C over the idle base, the cards -8.0 / -7.2 °C. So the
+PM1725's own heat reaches its neighbour by about 2 °C at this load, small next to the cross-zone effect; NIC traffic is
+still untested (no subnet manager). This confirms `UNMONITORED` mellanox `(1000, 4)`: the follow rule keeps fan 3 from
+falling below fan 4, which is the unstable case. Under 2.0.1, which lets the middle fan idle low, the cabled slot 5 card
+idled at 63 °C (18:12).
+
+**Hardware qualification (2026-10-23, kernel 7.0.0-38+barfix4, with the peripherals above).** First run
+(`tests/hardware/results-20261023-1317-202.txt`, executable `760937f4`): 36/38. T14 failed on test calibration (its
+900 W test budget left the dies no headroom above the CPU's share once the peripherals raised the base to 262 W; the
+budget tests now use 900 + (base - 127) W). T29 checked a status line logged before the sensors came back (test
+timing); its log also showed a 25 s stale alarm on a driver unload, hence `RETIRE_UNBOUND` 120 -> 20 s. T21/T22 passed
+but logged false "changed by another writer" alarms: the fan thread checked a fan's registers microseconds after
+writing them, and the SMC shows a write 13-203 ms later (measured) -> `VERIFY_SETTLE`, now asserted by T21/T22.
+Second run on the fixed build (`results-20261023-1352-202b.txt`, executable `c0f1116b`): **38/38**. (Its exit status
+read 1 from the last test's cleanup command; the runner now ends with `:` so only failures set it.)
+Release qualification on the installed package (2026-10-24, `results-20261024-1834-202pkg.txt`, executable
+`be3ef504`: the package build, which differs from `c0f1116b` only by Ubuntu's `RUSTFLAGS=-Cforce-frame-pointers=yes`):
+**38/38** in 31 minutes; `failover-tests.sh` on the same package (`failover-20261024-1833-202pkg.txt`): **9/9**.
+
+**Resource cost against 2.0.1** (2026-10-23: the
+installed 2.0.1 service and the 2.0.2 build as a transient unit set up like the service, alternating, 300 s idle
+windows after 60 s settling, 180 s under a four-die burn, three starts each): CPU 0.551 -> 0.568 % of a core idle
+(two windows each, identical within 0.006), 0.571 -> 0.563 % under burn; user CPU 0.55 -> 0.89 s/h, kernel 19.3 ->
+19.5 s/h; threads 4 -> 11; PSS 1.67 -> 2.11 MB; wakeups 85 -> 84 /s; syscalls 123 -> 134 /s; start to READY
+1.13 -> 1.39 s (98 -> 115 ms CPU).
+

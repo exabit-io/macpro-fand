@@ -6,9 +6,11 @@ use crate::{
     hardware::{
         self, DcReader, Die, DieSpec, Fans, FsPowerIo, GpuReader, GpuSample, Paths, Sensors,
     },
+    inventory,
     literal::Value,
     os::{self, Lock, Services, Systemd},
     power::{call_deadline, DeadlineIo, OwnedIo, PowerWorker, Status},
+    sampling::{self, DeviceReader, Platform, PlatformSpec, Scanner, Stall},
     transaction, CAPS, GPU_STALE, PERIOD, PL2, RAPL,
 };
 use std::{
@@ -27,6 +29,7 @@ pub enum Mode {
     Release,
     Stopped,
     CheckConfig,
+    Inventory,
     Version,
     Help,
 }
@@ -49,6 +52,7 @@ impl Options {
                 "--release" => Some(Mode::Release),
                 "--stopped" => Some(Mode::Stopped),
                 "--check-config" => Some(Mode::CheckConfig),
+                "--inventory" => Some(Mode::Inventory),
                 "--version" => {
                     return Ok(Self {
                         mode: Mode::Version,
@@ -74,7 +78,8 @@ impl Options {
             if let Some(mode) = mode {
                 if set {
                     return Err(
-                        "select only one of --dry-run, --release, --stopped, --check-config".into(),
+                        "select only one of --dry-run, --release, --stopped, --check-config, --inventory"
+                            .into(),
                     );
                 }
                 opt.mode = mode;
@@ -84,7 +89,7 @@ impl Options {
         Ok(opt)
     }
 }
-const HELP:&str="macpro-fand: Mac Pro 7,1 zone fan control and power budget\n\nUsage: macpro-fand [--config PATH] [--dry-run | --release | --stopped | --check-config]\n  --dry-run       Compute and log; write no fan or power limit\n  --release       Confirm static-safe limits and hand fans to t2fanrd\n  --stopped       systemd ExecStopPost recovery hook\n  --check-config  Validate configuration and hardware budget, then exit\n  --version       Print version\n";
+const HELP:&str="macpro-fand: Mac Pro 7,1 zone fan control and power budget\n\nUsage: macpro-fand [--config PATH] [--dry-run | --release | --stopped | --check-config | --inventory]\n  --dry-run       Compute and log; write no fan or power limit\n  --release       Confirm static-safe limits and hand fans to t2fanrd\n  --stopped       systemd ExecStopPost recovery hook\n  --check-config  Validate configuration and hardware budget, then exit\n  --inventory     Print the peripherals the budget charges and the sensors that steer fans (JSON), then exit\n  --version       Print version\n";
 fn error(message: impl Into<String>) {
     crate::log(&[("error", message.into().into())]);
 }
@@ -96,6 +101,13 @@ fn r1(v: Option<f64>) -> Value {
 }
 fn numbers(values: impl IntoIterator<Item = f64>) -> Value {
     Value::array(values.into_iter().map(|v| control::round_even(v).into()))
+}
+fn follow_value(f: &inventory::Floors) -> Value {
+    Value::object(
+        f.follow_lists()
+            .into_iter()
+            .map(|(k, v)| (k, Value::array(v.into_iter().map(Value::from)))),
+    )
 }
 fn strings(values: impl IntoIterator<Item = String>) -> Value {
     Value::array(values.into_iter().map(Value::from))
@@ -121,7 +133,7 @@ fn recover_with_fallback(
     let (p, config) = (paths.clone(), c.clone());
     let Some((mut found, mut missing, devices)) = call_deadline(end, move || {
         let (found, missing) = hardware::cap_paths(&p, &config);
-        (found, missing, hardware::devices(&p))
+        (found, missing, inventory::devices(&p, &config))
     }) else {
         error("static-safe recovery: inventory read stuck");
         return false;
@@ -309,6 +321,8 @@ pub struct Engine {
     pub alarms: Vec<String>,
     pub notes: Vec<String>,
     pub override_note: String,
+    /// Extra zone floors for devices with no live temperature sensor (`UNMONITORED`); automatic mode only.
+    pub floors: inventory::Floors,
     energy_prev: Option<(f64, f64)>,
     last_budget: f64,
     dc_missing_since: Option<f64>,
@@ -347,6 +361,7 @@ impl Engine {
             alarms: vec![],
             notes: vec![],
             override_note: String::new(),
+            floors: inventory::Floors::default(),
             energy_prev: None,
             last_budget: 0.0,
             dc_missing_since: None,
@@ -601,6 +616,9 @@ impl Engine {
                 f.overwritten
             ));
         }
+        // A followed fan's floor uses its speed from the previous loop.
+        let speeds: [f64; 4] = std::array::from_fn(|i| self.governors[i].rpm);
+        let floors: [f64; 4] = std::array::from_fn(|i| self.floors.of(i, &speeds));
         std::array::from_fn(|i| {
             let g = &mut self.governors[i];
             g.step(&errs[i], f.dt);
@@ -608,6 +626,8 @@ impl Engine {
                 g.rpm = CAPS[i];
             } else if let FanMode::Hold(rpm) = self.mode {
                 g.rpm = rpm[i];
+            } else {
+                g.rpm = g.rpm.max(floors[i].min(CAPS[i]));
             }
             control::round_even(g.rpm)
         })
@@ -730,6 +750,8 @@ struct Session {
     paths: Paths,
     config: Config,
     fans: Fans,
+    /// The fan and platform I/O thread; frozen before cleanup writes the caps.
+    platform: Option<Platform>,
     worker: Option<PowerWorker>,
     owner: Option<Arc<Lock>>,
     dry: bool,
@@ -747,7 +769,11 @@ impl Session {
         if self.dry {
             return Ok(());
         }
-        // Cooling precedes every wait on the power worker.
+        // Cooling precedes every wait on the power worker. The I/O thread is frozen first, so none of its
+        // writes can land after the caps.
+        if let Some(p) = &self.platform {
+            p.freeze(Duration::from_secs(2));
+        }
         let cooling = self.fans.full();
         let idle = self
             .worker
@@ -778,6 +804,9 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.finished && !self.dry {
+            if let Some(p) = &self.platform {
+                p.freeze(Duration::from_secs(2));
+            }
             self.fans.full();
             let idle = self
                 .worker
@@ -892,7 +921,7 @@ pub fn entry() -> i32 {
     if opt.mode == Mode::CheckConfig {
         return match config.check_feasible(
             hardware::die_map(&paths, &config).len(),
-            &hardware::devices(&paths),
+            &inventory::devices(&paths, &config),
         ) {
             Ok(()) => {
                 println!("configuration OK");
@@ -904,6 +933,68 @@ pub fn entry() -> i32 {
                 NOHW
             }
         };
+    }
+    if opt.mode == Mode::Inventory {
+        let devices = inventory::devices(&paths, &config);
+        let mut sensors = inventory::sensors(&paths, &config);
+        sensors.extend(inventory::command_sensors(
+            &paths, &config, &devices, &sensors,
+        ));
+        let floors = inventory::unmonitored_floors(
+            &config,
+            &devices,
+            &sensors
+                .iter()
+                .filter_map(|s| s.device.clone())
+                .collect::<Vec<_>>(),
+        );
+        crate::log(&[
+            ("base", config.base.into()),
+            ("budget_base", config.fixed_base(&devices).into()),
+            (
+                "peripherals",
+                Value::array(devices.iter().map(|d| {
+                    Value::object([
+                        ("key".into(), d.key.clone().into()),
+                        ("class".into(), d.class.clone().into()),
+                        ("label".into(), d.label.clone().into()),
+                        (
+                            "slot".into(),
+                            d.slot.clone().map(Value::from).unwrap_or(Value::None),
+                        ),
+                        ("fan".into(), d.zone.map(Value::from).unwrap_or(Value::None)),
+                        ("w".into(), d.watts.into()),
+                    ])
+                })),
+            ),
+            (
+                "sensors",
+                Value::array(sensors.iter().map(|s| {
+                    Value::object([
+                        ("key".into(), s.key.clone().into()),
+                        (
+                            "device".into(),
+                            s.device.clone().map(Value::from).unwrap_or(Value::None),
+                        ),
+                        ("fan".into(), s.spec.fan.into()),
+                        ("target".into(), s.spec.target.into()),
+                        ("emergency".into(), s.spec.emergency.into()),
+                        (
+                            "source".into(),
+                            if s.command.is_some() {
+                                "command"
+                            } else {
+                                "hwmon"
+                            }
+                            .into(),
+                        ),
+                    ])
+                })),
+            ),
+            ("unmonitored_floors", numbers(floors.rpm)),
+            ("unmonitored_follow", follow_value(&floors)),
+        ]);
+        return 0;
     }
     if !matches!(opt.mode, Mode::DryRun) && os::uid() != 0 {
         error("hardware control requires root");
@@ -928,7 +1019,7 @@ pub fn entry() -> i32 {
     }
     if let Err(e) = config.check_feasible(
         hardware::die_map(&paths, &config).len(),
-        &hardware::devices(&paths),
+        &inventory::devices(&paths, &config),
     ) {
         error(e);
         return NOHW;
@@ -991,9 +1082,11 @@ pub fn entry() -> i32 {
             hook_number("MACPRO_FAND_TEST_TWORK")?,
             hook_number("MACPRO_FAND_TEST_STALL_GPU")?,
             hook_number("MACPRO_FAND_TEST_DEAD_FAN")?,
+            hook_number("MACPRO_FAND_TEST_STALL_TEMPS")?,
+            hook_number("MACPRO_FAND_TEST_STALL_FANS")?,
         ))
     })();
-    let (limit, backstop, twork, stall, dead_fan) = match hooks {
+    let (limit, backstop, twork, stall, dead_fan, stall_temps, stall_fans) = match hooks {
         Ok(v) => v,
         Err(e) => {
             error(e);
@@ -1006,6 +1099,8 @@ pub fn entry() -> i32 {
         || backstop.is_some_and(|v| v > config.budget_limit)
         || twork.is_some_and(|v| !(40.0..=95.0).contains(&v))
         || stall.is_some_and(|v| v > 86400.0)
+        || stall_temps.is_some_and(|v| v > 86400.0)
+        || stall_fans.is_some_and(|v| v > 86400.0)
         || dead_fan.is_some_and(|v| !(1.0..=4.0).contains(&v) || v.fract() != 0.0)
     {
         error("test hook outside its safe range");
@@ -1032,7 +1127,9 @@ pub fn entry() -> i32 {
     }
     if !dry
         && hardware::hwmon_named(&paths, "drivetemp").is_empty()
-        && hardware::devices(&paths).get("disk").copied().unwrap_or(0) > 0
+        && inventory::devices(&paths, &config)
+            .iter()
+            .any(|d| d.zone.is_some() && matches!(d.class.as_str(), "disk" | "ssd"))
     {
         let _ = os::command(
             "/usr/sbin/modprobe",
@@ -1069,8 +1166,12 @@ pub fn entry() -> i32 {
             }
         }
     }
-    let inventory = hardware::devices(&paths);
+    let inventory = inventory::devices(&paths, &config);
     let base = config.fixed_base(&inventory);
+    let mut periph = inventory::sensors(&paths, &config);
+    periph.extend(inventory::command_sensors(
+        &paths, &config, &inventory, &periph,
+    ));
     let caps = specs
         .iter()
         .map(|d| (d.addr.clone(), d.cap.to_string_lossy().into_owned()))
@@ -1091,6 +1192,7 @@ pub fn entry() -> i32 {
         paths: paths.clone(),
         config: config.clone(),
         fans,
+        platform: None,
         worker: None,
         owner: _owner.clone(),
         dry,
@@ -1124,6 +1226,32 @@ pub fn entry() -> i32 {
                 g.rpm = cap;
             }
         }
+        // One reader thread per peripheral sensor: a drive or card that holds a temperature read only makes its
+        // own reading stale. A sensor steers its fan (and its loss alarms) only from its first reading: one that
+        // never reads (a TEMP_COMMAND whose tool is not ready) leaves its device unmonitored, not alarmed.
+        let mut readers: BTreeMap<String, DeviceReader> = BTreeMap::new();
+        let mut pending: BTreeSet<String> = BTreeSet::new();
+        for s in periph {
+            pending.insert(s.key.clone());
+            readers.insert(
+                s.key.clone(),
+                DeviceReader::start(s, &config).map_err(|e| e.to_string())?,
+            );
+        }
+        let mut retired: BTreeSet<String> = BTreeSet::new();
+        let mut silent: BTreeSet<String> = BTreeSet::new();
+        let monitored = |readers: &BTreeMap<String, DeviceReader>, off: &[&BTreeSet<String>]| {
+            readers
+                .iter()
+                .filter(|(k, _)| off.iter().all(|o| !o.contains(*k)))
+                .filter_map(|(_, r)| r.sensor.device.clone())
+                .collect::<Vec<_>>()
+        };
+        engine.floors = inventory::unmonitored_floors(
+            &config,
+            &inventory,
+            &monitored(&readers, &[&retired, &pending]),
+        );
         crate::log(&[
             ("version", crate::VERSION.into()),
             ("dry_run", dry.into()),
@@ -1155,7 +1283,11 @@ pub fn entry() -> i32 {
                     ("base".into(), base.into()),
                     (
                         "devices".into(),
-                        Value::object(inventory.iter().map(|(k, v)| (k.clone(), (*v).into()))),
+                        Value::object(
+                            inventory::counts(&inventory)
+                                .into_iter()
+                                .map(|(k, v)| (k, v.into())),
+                        ),
                     ),
                     ("unmanaged_dies".into(), strings(engine.missing.clone())),
                     ("rapl_enforcing".into(), enforcing.into()),
@@ -1163,6 +1295,30 @@ pub fn entry() -> i32 {
                     ("fits".into(), engine.budget.feasible().into()),
                 ]),
             ),
+            (
+                "peripherals",
+                Value::array(inventory.iter().map(|d| {
+                    let sensor = readers
+                        .values()
+                        .find(|r| r.sensor.device.as_deref() == Some(&d.key))
+                        .map(|r| Value::from(r.sensor.key.clone()))
+                        .unwrap_or(Value::None);
+                    Value::object([
+                        ("key".into(), d.key.clone().into()),
+                        ("class".into(), d.class.clone().into()),
+                        ("label".into(), d.label.clone().into()),
+                        (
+                            "slot".into(),
+                            d.slot.clone().map(Value::from).unwrap_or(Value::None),
+                        ),
+                        ("fan".into(), d.zone.map(Value::from).unwrap_or(Value::None)),
+                        ("w".into(), d.watts.into()),
+                        ("sensor".into(), sensor),
+                    ])
+                })),
+            ),
+            ("unmonitored_floors", numbers(engine.floors.rpm)),
+            ("unmonitored_follow", follow_value(&engine.floors)),
         ]);
         if !dry {
             let end = Instant::now() + Duration::from_secs(10);
@@ -1190,6 +1346,32 @@ pub fn entry() -> i32 {
         if os::stopped() {
             return Ok(());
         }
+        session.platform = Some(
+            Platform::start(
+                PlatformSpec {
+                    cpu: sensors.cpu.path.clone(),
+                    smc: sensors
+                        .ambient
+                        .iter()
+                        .map(|(k, (_, s))| (k.clone(), s.path.clone()))
+                        .collect(),
+                    fans: session.fans.clone(),
+                },
+                if dry {
+                    None
+                } else {
+                    Some(std::array::from_fn(|i| engine.governors[i].rpm))
+                },
+                Stall {
+                    temps: stall_temps.map(Duration::from_secs_f64),
+                    fans: stall_fans.map(Duration::from_secs_f64),
+                },
+            )
+            .map_err(|e| e.to_string())?,
+        );
+        let scanner = Scanner::start(paths.clone(), config.clone()).map_err(|e| e.to_string())?;
+        let mut scan_seq = 0u64;
+        let mut withheld = false;
         notify("READY=1");
         let origin = Instant::now();
         let mut last = origin;
@@ -1206,33 +1388,107 @@ pub fn entry() -> i32 {
             let dt = instant.duration_since(last).as_secs_f64().min(5.0 * PERIOD);
             last = instant;
             let st = session.worker.as_ref().map(PowerWorker::status);
-            let overwritten = if dry {
-                vec![]
-            } else {
-                engine
-                    .written
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, w)| {
-                        w.filter(|w| !session.fans.holds(i + 1, *w)).map(|_| i + 1)
-                    })
-                    .collect()
+            let platform = session.platform.as_ref().expect("started before READY");
+            if let Some(e) = platform.error() {
+                return Err(e);
+            }
+            // Platform readings older than PLATFORM_STALE count as missing (the read alarms follow).
+            let fresh = |t: Instant| {
+                instant.saturating_duration_since(t).as_secs_f64() <= sampling::PLATFORM_STALE
             };
-            for &f in &overwritten {
-                if let Err(e) = session.fans.put(f, engine.written[f - 1].unwrap()) {
-                    return Err(format!("reassert fan{f}: {e}"));
+            let ts = platform.temps().filter(|s| fresh(s.taken));
+            let fs = platform.fans().filter(|s| fresh(s.taken));
+            // Peripheral sensors: new ones from the rescan, retired ones (device gone, driver gone, or no
+            // reading for long) fall back to their device's UNMONITORED floor; a retired one that reads again
+            // comes back.
+            if let Some((seq, found)) = scanner.latest() {
+                if seq != scan_seq {
+                    scan_seq = seq;
+                    for s in found {
+                        if readers.contains_key(&s.key) {
+                            continue;
+                        }
+                        note(format!(
+                            "sensor {} found: fan {}, target {} C",
+                            s.key, s.spec.fan, s.spec.target
+                        ));
+                        pending.insert(s.key.clone());
+                        readers.insert(
+                            s.key.clone(),
+                            DeviceReader::start(s, &config).map_err(|e| e.to_string())?,
+                        );
+                    }
                 }
             }
+            let mut gone = vec![];
+            for (k, r) in &readers {
+                if pending.contains(k) {
+                    if r.value(instant).is_some() {
+                        pending.remove(k);
+                        engine
+                            .ambient
+                            .insert(k.clone(), (r.sensor.spec.clone(), Filter::new(10.0)));
+                        if silent.remove(k) {
+                            note(format!(
+                                "sensor {k} reads: governing fan {}",
+                                r.sensor.spec.fan
+                            ));
+                        }
+                    } else if r.status(instant) == sampling::DeviceStatus::Gone {
+                        gone.push(k.clone());
+                    } else if r.running_for(instant) > 60.0 && silent.insert(k.clone()) {
+                        note(format!(
+                            "sensor {k} has no reading yet; its zone keeps the device's UNMONITORED floor"
+                        ));
+                    }
+                } else if retired.contains(k) {
+                    if r.value(instant).is_some() {
+                        retired.remove(k);
+                        engine
+                            .ambient
+                            .insert(k.clone(), (r.sensor.spec.clone(), Filter::new(10.0)));
+                        note(format!(
+                            "sensor {k} reads again: governing fan {}",
+                            r.sensor.spec.fan
+                        ));
+                    } else if r.status(instant) == sampling::DeviceStatus::Gone {
+                        gone.push(k.clone());
+                    }
+                } else if let Some(why) = r.retire(instant) {
+                    retired.insert(k.clone());
+                    engine.ambient.remove(k);
+                    note(format!(
+                        "sensor {k} retired ({why}); its zone keeps the device's UNMONITORED floor"
+                    ));
+                }
+            }
+            for k in gone {
+                readers.remove(&k);
+                retired.remove(&k);
+                pending.remove(&k);
+                silent.remove(&k);
+            }
+            engine.floors = inventory::unmonitored_floors(
+                &config,
+                &inventory,
+                &monitored(&readers, &[&retired, &pending]),
+            );
             let frame = Frame {
                 now,
                 dt,
                 instant,
                 gpu: gpu.latest(),
-                cpu_temp: hardware::number(&sensors.cpu.path, sensors.cpu.scale),
-                ambient: sensors
+                cpu_temp: ts.as_ref().and_then(|s| s.cpu_temp),
+                ambient: engine
                     .ambient
-                    .iter()
-                    .map(|(k, (_, s))| (k.clone(), hardware::number(&s.path, s.scale)))
+                    .keys()
+                    .map(|k| {
+                        let v = match readers.get(k) {
+                            Some(r) => r.value(instant),
+                            None => ts.as_ref().and_then(|s| s.smc.get(k).copied().flatten()),
+                        };
+                        (k.clone(), v)
+                    })
                     .collect(),
                 energy: hardware::number(paths.resolve(RAPL).join("energy_uj"), 1.0),
                 energy_range: range,
@@ -1248,10 +1504,13 @@ pub fn entry() -> i32 {
                     if dead_fan == Some((i + 1) as f64) {
                         Some(0.0)
                     } else {
-                        hardware::number(session.fans.path(i + 1, "input"), 1.0)
+                        fs.as_ref().and_then(|s| s.tach[i])
                     }
                 }),
-                overwritten,
+                overwritten: fs
+                    .as_ref()
+                    .map(|s| s.overwritten.clone())
+                    .unwrap_or_default(),
                 override_: Override::load(&paths.override_file(), &config),
             };
             let cmd = engine.step(frame);
@@ -1265,6 +1524,7 @@ pub fn entry() -> i32 {
                     engine.budget.feasible(),
                 );
             }
+            let mut out = [None; 4];
             for (i, rpm) in cmd.iter().copied().enumerate() {
                 let should = engine.written[i]
                     .map(|v| {
@@ -1272,16 +1532,28 @@ pub fn entry() -> i32 {
                     })
                     .unwrap_or(true);
                 if should {
-                    if !dry {
-                        session
-                            .fans
-                            .put(i + 1, rpm)
-                            .map_err(|e| format!("write fan{}: {e}", i + 1))?;
-                    }
+                    out[i] = Some(rpm);
                     engine.written[i] = Some(rpm);
                 }
             }
-            notify("WATCHDOG=1");
+            if !dry && out.iter().any(Option::is_some) {
+                platform.command(out);
+            }
+            // The keepalive means "the loop runs AND the platform I/O makes progress": a short I/O stall is
+            // ridden through on the read alarms, one longer than IO_STALL goes to the watchdog's restart.
+            let age = platform.round_age(Instant::now());
+            if age <= sampling::IO_STALL {
+                notify("WATCHDOG=1");
+                if withheld {
+                    withheld = false;
+                    note(format!("platform I/O back after {age:.0} s"));
+                }
+            } else if !withheld {
+                withheld = true;
+                error(format!(
+                    "platform I/O stalled for {age:.0} s: watchdog keepalive withheld"
+                ));
+            }
             if !engine.alarms.is_empty()
                 || engine.override_note != last_note
                 || now - last_log >= 30.0
@@ -1441,6 +1713,32 @@ mod tests {
         assert!(e.notes.iter().any(|n| n == "budget feasible again"));
     }
     #[test]
+    fn unmonitored_floor_follows_another_fan_in_auto_only() {
+        let mut e = engine();
+        let mut floors = inventory::Floors::default();
+        floors.rpm[2] = 1000.0;
+        floors.follow[2][3] = true;
+        e.floors = floors;
+        e.step(frame(0.0, 1));
+        let out = e.step(frame(2.0, 2));
+        assert!(out[2] >= 1000.0, "the fixed floor: {out:?}");
+        e.governors[3].rpm = 1400.0;
+        let out = e.step(frame(4.0, 3));
+        assert!(out[2] >= 1400.0, "fan 3 follows fan 4: {out:?}");
+        let mut f = frame(6.0, 4);
+        f.override_.mode = FanMode::Hold([600.0, 700.0, 700.0, 700.0]);
+        assert_eq!(e.step(f), [600.0, 700.0, 700.0, 700.0], "a hold is exact");
+        let mut f = frame(8.0, 5);
+        f.cpu_temp = None;
+        e.step(f);
+        let mut f = frame(10.0, 6);
+        f.cpu_temp = None;
+        e.step(f);
+        let mut f = frame(12.0, 7);
+        f.cpu_temp = None;
+        assert_eq!(e.step(f), CAPS, "alarms still send every fan to its cap");
+    }
+    #[test]
     fn alarms_out_rank_hold_and_missing_dc_degrades() {
         let mut e = engine();
         let mut f = frame(2.0, 1);
@@ -1546,6 +1844,7 @@ mod tests {
                 paths,
                 config: Config::default(),
                 fans: Fans { smc },
+                platform: None,
                 worker: None,
                 owner: None,
                 dry: false,
@@ -1685,7 +1984,7 @@ mod tests {
     fn stop_hook_uses_defaults_for_infeasible_config() {
         let (root, mut session) = fixture_session();
         let bad = Config::from_text("BASE=1100").unwrap();
-        assert!(bad.check_feasible(0, &BTreeMap::new()).is_err());
+        assert!(bad.check_feasible(0, &[]).is_err());
         let mut services = FakeServices { calls: vec![] };
         assert_eq!(stop_hook(&session.paths, &bad, &mut services, true), 0);
         assert_eq!(
