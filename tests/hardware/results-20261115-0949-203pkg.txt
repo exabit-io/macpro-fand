@@ -1,0 +1,44 @@
+macpro-fand 2.0.3 (/usr/sbin/macpro-fand -> /usr/sbin/macpro-fand), config /root/macpro-fand-rust/tests/hardware/test.conf
+tested daemon sha256 a7b9e16e844ae0a53e75051d148c3640b4cf3f17ace734bee61e44977b75927d; installed 2.0.3 sha256 a7b9e16e844ae0a53e75051d148c3640b4cf3f17ace734bee61e44977b75927d
+start: t2fanrd active, outputs 500 500 500 500 , manual 1111
+PASS  T1 dry run logs, writes no fan and leaves t2fanrd running
+PASS  T1b refuses to run by hand beside t2fanrd
+PASS  T2 takeover: t2fanrd stopped, governed: 600 1150 1150 500 
+PASS  T3a override max -> caps
+PASS  T3b hold 600/900 (blower not coupled)
+PASS  T3c expired hold ignored -> governors in control (700 1400 1400 1400 )
+PASS  T3d malformed override logged and ignored
+PASS  T4 second writer detected (alarm)
+PASS  T5 kill -9: caps (1200 2500 2500 2500 ) then restarted under the governors (600 1150 1150 500 )
+PASS  T6 stalled GPU reader -> caps, loop alive
+PASS  T7 dead fan -> caps, latched for 60 s
+PASS  T8 clean stop hands the fans to t2fanrd
+PASS  T9 t2fanrd start beside macpro-fand is refused
+PASS  T10 restart keeps macpro-fand in charge
+PASS  T11 t2fanrd refused in the restart window; macpro-fand back in charge
+PASS  T12 permanent failure -> t2fanrd; next start takes the fans back
+PASS  T24 t2fanrd stop with no owner -> full speed: 1200 2500 2500 2500 
+PASS  T25 no backup: fans stay at full speed
+PASS  T13a start: GPUs 125 W, 125 125 125 125 pl1 240, PL2 240 ("cost": 1148)
+PASS  T13b clean stop -> static-safe limits (125 125 125 125 pl1 240, PL2 240; 125 125 125 125 pl1 240)
+PASS  T14 GPU-only under a 1041 W test budget: 1 rebalances, caps now 132 132 132 132 pl1 114, max DC 853 W
+PASS  T15 GPU + CPU spike under a 1041 W test budget: max DC 862 W, caps 85 85 85 85 pl1 314
+PASS  T16 backstop: DC over 500 W (test) -> every limit to its floor (85 85 85 85 pl1 80, PL2 80)
+PASS  T17 outside write (0b -> 200 W) overwritten (125 125 125 125 pl1 240)
+PASS  T18 kill -9 -> static-safe limits before the restart (130 130 130 130 pl1 123 -> 125 125 125 125 pl1 240)
+PASS  T19 pl1 pin: 125 125 125 125 pl1 240 -> 125 125 125 125 pl1 60 -> 125 125 125 125 pl1 240 (PL2 follows)
+PASS  T20 CPU first: 130 130 130 130 pl1 125 -> CPU load -> 85 85 85 85 pl1 314, max DC 872 W
+PASS  T21 working-temperature ceilings (45 C test): caps 85 85 85 85 pl1 406, "tcap": [85, 85, 85, 85]
+PASS  T22 shipped config ceiling: caps never above 125 W under a 4-die burn (max 125, now 125 125 125 125 pl1 240, 40 samples)
+PASS  T23a unit beside a foreground owner: refused (5), its stop hook left the owner alone (2 x, no power transaction), limits 125 125 125 125 pl1 240, fans 600 1318 1303 500 
+PASS  T23b foreground stop: worker stopped, static-safe confirmed (125 125 125 125 pl1 240), t2fanrd in charge (exit 0)
+PASS  T26 inventory matches the kernel (ok 10 268): budget base 268 W
+PASS  T27 stalled temperature reads -> caps by the fan thread, no restart after 100 s ("alarms": ["read cpu", "read TM0P", "read TM1P", "read TM2P", "read TM3P", "read)
+PASS  T28 stalled fan thread -> keepalive withheld -> watchdog restart -> governed (600 1150 1150 500 )
+PASS  T29 drivetemp unloaded -> 2 sensors retired without an alarm, governed (600 1639 1201 500 ); loaded -> 2 read again
+FAIL  T30 TEMP_COMMAND: 0 sensors, values '', {"alarms": [], "mode": "auto", "note": null, "dies": {"0b:00.0": [39, 37, 32.2], "0e:00.0": [38.8, 35.2, 33], "19:00.0":
+FAIL  T31 UNMONITORED: fan 3 at 1156, 600 1175 1156 500 , "unmonitored_floors": [0, 0, 1400, 0
+FAIL  T31b follow: fan 4 max 2500, fan 3 lag up to 1331 rpm, cpu load ok 0
+logs: /tmp/tmp.aFf9lI0srD
+restored: installed macpro-fand active
+end: t2fanrd inactive, outputs 600 1150 1150 500 , manual 1111; 35 passed, 3 failed

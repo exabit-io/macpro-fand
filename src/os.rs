@@ -200,6 +200,8 @@ pub trait Services {
     fn active(&mut self, unit: &str) -> io::Result<bool>;
     fn exists(&mut self, unit: &str) -> io::Result<bool>;
     fn restarting(&mut self) -> io::Result<bool>;
+    /// The system is shutting down, rebooting or halting: systemd refuses new start jobs.
+    fn shutting_down(&mut self) -> io::Result<bool>;
     fn start(&mut self, unit: &str) -> io::Result<bool>;
 }
 pub struct Systemd;
@@ -236,6 +238,11 @@ impl Services for Systemd {
     }
     fn start(&mut self, unit: &str) -> io::Result<bool> {
         Ok(self.ctl(&["start", "--no-block", unit])?.success)
+    }
+    fn shutting_down(&mut self) -> io::Result<bool> {
+        // The manager reports "stopping" from the moment a shutdown, reboot, halt or kexec job is queued.
+        // The command exits non-zero for every state but "running", so only its output is read.
+        Ok(self.ctl(&["is-system-running"])?.stdout.trim() == "stopping")
     }
     fn restarting(&mut self) -> io::Result<bool> {
         let text = fs::read_to_string("/proc/self/cgroup")?;

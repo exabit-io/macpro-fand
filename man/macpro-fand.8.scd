@@ -257,7 +257,9 @@ Override pins (below) suspend the ceilings.
 
 *--stopped*
 	The service's ExecStopPost hook. After a clean stop: every fan to its
-	full speed, then t2fanrd (unless the service itself is restarting).
+	full speed, then t2fanrd (unless the service itself is restarting or
+	the system is shutting down: systemd refuses to start a unit then, and
+	the fans stay at full speed until the machine is off).
 	After a failure (crash, watchdog, kill): every fan to its full speed.
 	In both cases the statically safe power limits are written. It takes
 	the owner lock first: if another *macpro-fand* holds it (this run was

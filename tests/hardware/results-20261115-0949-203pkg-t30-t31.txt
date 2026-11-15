@@ -1,0 +1,9 @@
+macpro-fand 2.0.3 (/usr/sbin/macpro-fand -> /usr/sbin/macpro-fand), config /root/macpro-fand-rust/tests/hardware/test.conf
+tested daemon sha256 a7b9e16e844ae0a53e75051d148c3640b4cf3f17ace734bee61e44977b75927d; installed 2.0.3 sha256 a7b9e16e844ae0a53e75051d148c3640b4cf3f17ace734bee61e44977b75927d
+start: t2fanrd active, outputs 500 500 500 500 , manual 1111
+PASS  T30 TEMP_COMMAND sensors (stub program on class pcie-switch: no sensorless Mellanox card in this machine): "pcie-switch:0000:20:00": 41 "pcie-switch:0000:6c:00": 41 
+PASS  T31 UNMONITORED pcie-switch 1400 rpm -> fan 3 at 1400 ("unmonitored_floors": [0, 0, 1400, 0)
+PASS  T31b fan 3 follows fan 4 for a sensorless card (fan 4 up to 2489, fan 3 never more than 69 rpm below)
+logs: /tmp/tmp.vl4cQOt0ra
+restored: installed macpro-fand active
+end: t2fanrd inactive, outputs 600 1150 1150 500 , manual 1111; 3 passed, 0 failed

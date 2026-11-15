@@ -4,7 +4,8 @@
 # ExecStopPost --stopped; t2fanrd is the backup governor and its drop-in refuses to start it beside macpro-fand).
 # Needs the 2.0.1+ system files installed (macpro-fand-backup.service, the t2fanrd drop-in and /usr/lib/macpro-fand/*).
 # Test numbers are stable across releases: T1-T12 service and failure paths, T13-T23 power budget, T24-T25 the
-# 2.0.1 fail-safes (numbered T13/T14 in the 2.0.1 log), T26-T31 the 2.0.2 sensor threads and peripherals.
+# 2.0.1 fail-safes (numbered T13/T14 in the 2.0.1 log), T26-T31 the 2.0.2 sensor threads and peripherals (T30-T31b on
+# whichever slot card has no temperature sensor: see sensorless()).
 # Needs: idle box, no other fan experiment running, t2fanrd installed. Leaves t2fanrd in charge at the end.
 # Each test prints PASS/FAIL; the fans are never left below their t2fanrd/floor settings.
 # The machine's load and telemetry tools are parameters (no defaults outside this tree):
@@ -416,26 +417,45 @@ end=$((SECONDS + 45)); until status_line "$T2" | grep -q '"drivetemp:' || [ $SEC
 modprobe drivetemp; stop_unit
 fi
 
-if want T30 && [ -x /usr/bin/mget_temp ]; then   # TEMP_COMMAND: the Mellanox cards' temperatures through MFT
-cp "$CONFIG_USED" $LOGD/t30.conf; echo "TEMP_COMMAND = {'mellanox': ('/usr/bin/mget_temp', '-d', '{pci}')}" >> $LOGD/t30.conf
-T0=$(date '+%Y-%m-%d %H:%M:%S'); CONF=$LOGD/t30.conf start_unit; wait_active $U active 60; sleep 35
-n=$(start_line "$T0" | grep -o '"sensor": "mellanox:[^"]*' | wc -l); L=$(status_line "$T0")
-v=$(echo "$L" | grep -o '"mellanox:[^"]*": [0-9.]*' | tr '\n' ' ')
-[ "$n" -ge 1 ] && [ "$(echo "$v" | wc -w)" = $((2 * n)) ] && echo "$L" | grep -q '"alarms": \[\]' \
-  && ok "T30 TEMP_COMMAND sensors: $v" || bad "T30 TEMP_COMMAND: $n sensors, values '$v', $(echo "$L" | cut -c1-120)"
-stop_unit
+# T30-T31b need a slot card that the daemon runs WITHOUT a temperature sensor. Until 2026-11-15 that was a ConnectX-4
+# (no mlx5 hwmon); the ConnectX-5 Ex that replaced it has one, and the sensorless cards are now the PEX 8718 switches of
+# the two Intel P4618. sensorless prints "CLASS FAN" of such a card from the installed service's last start line (a
+# Mellanox card first, for the MFT path), or nothing when every slot card has a sensor.
+sensorless() { journalctl -u macpro-fand -o cat --no-pager 2>/dev/null | grep '"peripherals"' | tail -1 | python3 -c '
+import json, sys
+try: P = [p for p in json.loads(sys.stdin.read())["peripherals"] if p.get("fan") and p.get("slot") and not p.get("sensor")]
+except Exception: P = []
+P.sort(key=lambda p: p["class"] != "mellanox")
+if P: print(P[0]["class"], P[0]["fan"])'; }
+read -r NS_CLASS NS_FAN <<< "$(sensorless)"
+if want T30; then   # TEMP_COMMAND: a sensorless slot card's temperature through a program (MFT for a Mellanox card)
+TC=""
+if [ "$NS_CLASS" = mellanox ] && [ -x /usr/bin/mget_temp ]; then TC="('/usr/bin/mget_temp', '-d', '{pci}')"; how="MFT"
+elif [ -n "$NS_CLASS" ] && [ "$NS_CLASS" != mellanox ]; then TC="('/bin/echo', '41')"; how="stub program on class $NS_CLASS: no sensorless Mellanox card in this machine"; fi
+if [ -n "$TC" ]; then
+cp "$CONFIG_USED" $LOGD/t30.conf; echo "TEMP_COMMAND = {'$NS_CLASS': $TC}" >> $LOGD/t30.conf
+if [ "$NS_CLASS" != mellanox ]; then   # a class without a temperature target of its own gets the Mellanox one
+  echo "PERIPH = {'nvme': (60, 1, 80), 'mlx5': (80, 1, 105), 'drivetemp': (40, 1, 60), 'mellanox': (80, 1, 105), '$NS_CLASS': (80, 1, 105)}" >> $LOGD/t30.conf
+  echo "PERIPH_POLL = {'nvme': (5, 30), 'mlx5': (5, 30), 'drivetemp': (30, 120), 'mellanox': (15, 60), '$NS_CLASS': (15, 60)}" >> $LOGD/t30.conf
 fi
-
-if want T31; then   # UNMONITORED floor: a Mellanox card with no sensor holds its slot zone's fan at the floor
-Z=$("$BIN" --inventory --config "$CONFIG_USED" | python3 -c 'import json,sys; P=[p for p in json.load(sys.stdin)["peripherals"] if p["class"]=="mellanox" and p["fan"]]; print(P[0]["fan"] if P else "")')
+T0=$(date '+%Y-%m-%d %H:%M:%S'); CONF=$LOGD/t30.conf start_unit; wait_active $U active 60; sleep 35
+n=$(start_line "$T0" | grep -o "\"sensor\": \"$NS_CLASS:[^\"]*" | wc -l); L=$(status_line "$T0")
+v=$(echo "$L" | grep -o "\"$NS_CLASS:[^\"]*\": [0-9.]*" | tr '\n' ' ')
+[ "$n" -ge 1 ] && [ "$(echo "$v" | wc -w)" = $((2 * n)) ] && echo "$L" | grep -q '"alarms": \[\]' \
+  && ok "T30 TEMP_COMMAND sensors ($how): $v" || bad "T30 TEMP_COMMAND ($how): $n sensors, values '$v', $(echo "$L" | cut -c1-120)"
+stop_unit
+else echo "SKIP  T30 (no sensorless slot card, or no MFT for a sensorless Mellanox card)"; fi
+fi
+if want T31; then   # UNMONITORED floor: a slot card with no sensor holds its slot zone's fan at the floor
+Z=$NS_FAN
 if [ -n "$Z" ]; then
-cp "$CONFIG_USED" $LOGD/t31.conf; echo "UNMONITORED = {'mellanox': 1400}" >> $LOGD/t31.conf
+cp "$CONFIG_USED" $LOGD/t31.conf; echo "UNMONITORED = {'$NS_CLASS': 1400}" >> $LOGD/t31.conf
 T0=$(date '+%Y-%m-%d %H:%M:%S'); CONF=$LOGD/t31.conf start_unit; wait_active $U active 60; sleep 20
 o=($(outs)); fl=$(start_line "$T0" | grep -o '"unmonitored_floors": \[[^]]*')
-[ "${o[$((Z - 1))]}" -ge 1400 ] && governed && ok "T31 UNMONITORED mellanox 1400 rpm -> fan $Z at ${o[$((Z - 1))]} ($fl)" \
+[ "${o[$((Z - 1))]}" -ge 1400 ] && governed && ok "T31 UNMONITORED $NS_CLASS 1400 rpm -> fan $Z at ${o[$((Z - 1))]} ($fl)" \
   || bad "T31 UNMONITORED: fan $Z at ${o[$((Z - 1))]}, $(outs), $fl"
 stop_unit
-cp "$CONFIG_USED" $LOGD/t31b.conf; echo "UNMONITORED = {'mellanox': (500, 4)}" >> $LOGD/t31b.conf   # follow fan 4
+cp "$CONFIG_USED" $LOGD/t31b.conf; echo "UNMONITORED = {'$NS_CLASS': (500, 4)}" >> $LOGD/t31b.conf   # follow fan 4
 echo "CPU_TARGET = ((133, 30), (228, 31))" >> $LOGD/t31b.conf   # a low CPU target: the load raises fan 4 at once
 T0=$(date '+%Y-%m-%d %H:%M:%S'); CONF=$LOGD/t31b.conf start_unit; wait_active $U active 60; sleep 10
 "$CPU_LOAD" 56 120 & CL=$!; worst=0; top=0; end=$((SECONDS + 110))
@@ -444,7 +464,7 @@ while [ $SECONDS -lt $end ]; do o=($(outs)); f=${o[3]}; m=${o[$((Z - 1))]}; [ "$
 [ $cok = 0 ] && [ "$top" -ge 900 ] && [ "$worst" -le 150 ] && ok "T31b fan $Z follows fan 4 for a sensorless card (fan 4 up to $top, fan $Z never more than $worst rpm below)" \
   || bad "T31b follow: fan 4 max $top, fan $Z lag up to $worst rpm, cpu load ok $cok"
 stop_unit
-else echo "SKIP  T31 (no Mellanox card in a governed slot)"; fi
+else echo "SKIP  T31 (no sensorless card in a governed slot)"; fi
 fi
 
 : # the exit status is the failure count's (restore), never the last test's cleanup command

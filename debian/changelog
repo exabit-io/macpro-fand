@@ -1,3 +1,14 @@
+macpro-fand (2.0.3) unstable; urgency=medium
+
+  * Stop hook: no handover to t2fanrd while the system shuts down. systemd
+    refuses start jobs then, so every shutdown and reboot of a machine with
+    t2fanrd installed ended with "handover failed: t2fanrd start was
+    refused", exit status 1 and the unit in the failed state. The fans and
+    the power limits are unaffected (full speed, statically safe limits, as
+    before).
+
+ -- Exabit Networks <packages@exabit.io>  Sun, 15 Nov 2026 09:50:00 +0000
+
 macpro-fand (2.0.2) unstable; urgency=medium
 
   * Sensor and fan I/O off the control thread (the 2026-10-22 watchdog

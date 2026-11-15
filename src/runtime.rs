@@ -225,9 +225,13 @@ fn recover_with_fallback(
     )]);
     result.ok && ss.fits
 }
+/// Hand the fans to t2fanrd where it is installed. Not while this service is being restarted (the new instance
+/// takes them) and not while the system shuts down: systemd refuses the start job then, the fans are already at
+/// their caps, and until 2.0.3 that refusal made every shutdown and reboot end with a failed stop hook.
 fn handback(services: &mut impl Services) -> io::Result<()> {
     if services.exists("t2fanrd.service")?
         && !services.restarting()?
+        && !services.shutting_down()?
         && !services.start("t2fanrd.service")?
     {
         return Err(io::Error::other("t2fanrd start was refused"));
@@ -1603,6 +1607,10 @@ mod tests {
             self.calls.push("restarting".into());
             Ok(false)
         }
+        fn shutting_down(&mut self) -> io::Result<bool> {
+            self.calls.push("shutting_down".into());
+            Ok(false)
+        }
         fn start(&mut self, u: &str) -> io::Result<bool> {
             self.calls.push(format!("start {u}"));
             Ok(true)
@@ -1801,11 +1809,46 @@ mod tests {
         }
         let mut s = FakeServices { calls: vec![] };
         assert_eq!(stop_hook(&paths, &Config::default(), &mut s, true), 0);
-        assert_eq!(s.calls.len(), 3);
+        assert_eq!(
+            s.calls,
+            [
+                "exists t2fanrd.service",
+                "restarting",
+                "shutting_down",
+                "start t2fanrd.service"
+            ]
+        );
         for (i, cap) in CAPS.iter().enumerate() {
             assert!(Fans { smc: smc.clone() }.holds(i + 1, *cap));
         }
         assert_eq!(hardware::number(paths.resolve(PL1), 1.0), Some(413e6));
+        // During a shutdown systemd refuses start jobs: the hook leaves t2fanrd alone and still succeeds, with the
+        // fans at their caps and the static-safe limits in place.
+        struct ShuttingDown;
+        impl Services for ShuttingDown {
+            fn active(&mut self, _: &str) -> io::Result<bool> {
+                panic!("unexpected service call")
+            }
+            fn exists(&mut self, _: &str) -> io::Result<bool> {
+                Ok(true)
+            }
+            fn restarting(&mut self) -> io::Result<bool> {
+                Ok(false)
+            }
+            fn shutting_down(&mut self) -> io::Result<bool> {
+                Ok(true)
+            }
+            fn start(&mut self, _: &str) -> io::Result<bool> {
+                Ok(false) // what systemd answers while it stops: before 2.0.3 this failed the hook
+            }
+        }
+        assert_eq!(
+            stop_hook(&paths, &Config::default(), &mut ShuttingDown, true),
+            0
+        );
+        for (i, cap) in CAPS.iter().enumerate() {
+            assert!(Fans { smc: smc.clone() }.holds(i + 1, *cap));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1991,7 +2034,7 @@ mod tests {
             hardware::number(session.paths.resolve(PL1), 1.0),
             Some(413e6)
         );
-        assert_eq!(services.calls.len(), 3);
+        assert_eq!(services.calls.len(), 4);
         session.finished = true;
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.3
+
+One fix: the stop hook no longer fails at every shutdown and reboot.
+
+- **Shutdown and reboot.** After a clean stop the hook hands the fans to t2fanrd where it is installed. While the
+  system shuts down systemd refuses every new start job, so on a machine with t2fanrd installed the hook ended each
+  shutdown and reboot with `stop hook: handover failed: t2fanrd start was refused`, exit status 1, the unit in the
+  failed state and an `OnFailure=` job that systemd could not queue either. The hook now asks the manager for its
+  state (`systemctl is-system-running` = `stopping`) and leaves t2fanrd alone during a shutdown, as it already does
+  while the service itself restarts. Nothing changes for the hardware: the fans were, and are, at full speed with
+  the statically safe power limits written before the handover is considered. Seen on the calibrated machine in
+  the journal of every shutdown since 2.0.1 made t2fanrd the backup.
+- Unit test: the hook succeeds with a service manager that reports a shutdown and would refuse the start.
+- Hardware tests T30, T31 and T31b assumed a Mellanox card without a temperature sensor (the ConnectX-4 cards of
+  2.0.2's test machine). They now take whichever slot card the daemon runs without a sensor, from the service's own
+  inventory: on the test machine as it is now (ConnectX-5 Ex with an mlx5 sensor, two Intel P4618) that is the PEX 8718
+  switch of each P4618. T30 then exercises `TEMP_COMMAND` with a stub program, since MFT only reads Mellanox cards.
+  Result on the installed package: 38 of 38 and 9 of 9 failover tests.
+
 ## 2.0.2
 
 Peripheral support (slot cards, SATA/USB disks) and sensor I/O off the control thread.

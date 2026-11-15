@@ -283,3 +283,21 @@ windows after 60 s settling, 180 s under a four-die burn, three starts each): CP
 19.5 s/h; threads 4 -> 11; PSS 1.67 -> 2.11 MB; wakeups 85 -> 84 /s; syscalls 123 -> 134 /s; start to READY
 1.13 -> 1.39 s (98 -> 115 ms CPU).
 
+
+## 2.0.3: the stop hook during a shutdown
+
+`handback()` (the handover to t2fanrd after a clean stop, `src/runtime.rs`) now also checks `Services::shutting_down()`
+(`systemctl is-system-running` printing `stopping`, `src/os.rs`). Before, the start request was refused during every
+shutdown and reboot, the hook returned 1 and the unit ended in the failed state; `OnFailure=` could not be queued either
+(`Transaction for macpro-fand-backup.service/start is destructive`). The order in the hook is unchanged: fans to full
+speed, statically safe limits, then the handover question. The hardware suite cannot produce a shutdown; the path is
+covered by the unit test in `recovery_and_hook_use_fixture_limits` and by the journal of the first shutdown with the
+package installed.
+
+**Hardware suite, 2026-11-15** (Xeon W-3275M, two Vega II Duo, ConnectX-5 Ex in slot 5, an Intel P4618 in each of
+slots 6 and 7, kernel 7.0.0-42, executable `a7b9e16e...`): the first run gave 35 of 38, with T30, T31 and T31b failing.
+The 2.0.2 executable fails the same three on this hardware: they required a Mellanox card without a temperature sensor,
+and the ConnectX-5 Ex has one (mlx5 hwmon). The three tests now select a sensorless slot card from the service's start
+line (`sensorless()` in the runner; here the PEX 8718 switches of the P4618 cards, with a stub `TEMP_COMMAND` program in
+T30) and pass: `tests/hardware/results-20261115-0949-203pkg.txt` (35 + the three failures),
+`results-20261115-0949-203pkg-t30-t31.txt` (the three, adapted), `failover-20261115-0949-203pkg.txt` (9 of 9).
