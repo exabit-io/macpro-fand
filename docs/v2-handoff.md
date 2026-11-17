@@ -310,5 +310,7 @@ creates for `APP0001` instead, and its fan attributes move from `/sys/bus/acpi/d
 (`src/hardware.rs`) now takes candidates from both buses, ACPI first; on 7.2 and earlier the platform node exists but has
 no fan attributes, so the choice is unchanged there. The `fans-to-max` failsafe and the two hardware runners use the same
 two places. t2fanrd 0.1.0-5 needs no change: its glob `/sys/devices/pci*/*/*/*/APP0001:00/fan*` reaches the platform
-device through the LPC bridge's `firmware_node/physical_node` links (code reading; confirm on the first 7.3 boot).
+device through the LPC bridge's `firmware_node/physical_node` links: confirmed on kernel 7.3.0-10-barfix5, where the failover
+suite passes 9 of 9 (F6/F7 run t2fanrd's own curve), `tests/hardware/failover-20261117-204pkg-k73barfix5.txt`. On 7.0.0-42:
+`failover-20261117-204pkg.txt` (9 of 9). With all four dies on 7.3 the daemon runs in normal mode (no alarms).
 Unit test: `find_smc_follows_the_bound_device_on_both_kernel_lines`.
