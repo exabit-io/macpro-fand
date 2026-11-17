@@ -1,3 +1,15 @@
+macpro-fand (2.0.4) unstable; urgency=medium
+
+  * Kernel 7.3 and later: find the SMC fan attributes on the platform device
+    APP0001:00 as well as on the ACPI device. applesmc-t2 0.1.5 binds the
+    platform device from 7.3 (struct acpi_driver is gone), so 2.0.3 would
+    report "applesmc fan attributes not found" there. The fans-to-max
+    failsafe looks in both places too; before, it would have left the fans
+    to the SMC on 7.3. Nothing changes on 7.2 and earlier: the ACPI device
+    is still looked at first.
+
+ -- Exabit Networks <packages@exabit.io>  Tue, 17 Nov 2026 10:00:00 +0000
+
 macpro-fand (2.0.3) unstable; urgency=medium
 
   * Stop hook: no handover to t2fanrd while the system shuts down. systemd

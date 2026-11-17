@@ -7,7 +7,9 @@ case "$(tr '[:upper:]' '[:lower:]' < /sys/class/dmi/id/product_name 2>/dev/null)
 *) echo "fans-to-max: not a MacPro7,1; fans left alone" >&2; exit 0 ;;
 esac
 n=0; rc=0
-for max in /sys/bus/acpi/devices/APP0001:*/fan*_max; do
+# applesmc-t2 puts the fan attributes on the ACPI device up to kernel 7.2 and on the platform device from 7.3;
+# only the bound one has them, so no fan is counted twice.
+for max in /sys/bus/acpi/devices/APP0001:*/fan*_max /sys/bus/platform/devices/APP0001:*/fan*_max; do
 	[ -r "$max" ] || continue
 	base=${max%_max}
 	v=$(cat "$max") || { rc=1; continue; }

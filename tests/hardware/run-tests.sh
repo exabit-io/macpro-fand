@@ -16,7 +16,8 @@
 #   CONF      the configuration for every test but T22 (default tests/hardware/test.conf); T22 uses ./macpro-fand.conf
 : "${BURN:?set BURN}" "${CPU_LOAD:?set CPU_LOAD}" "${SMC_LIB:?set SMC_LIB}"
 D=$(cd "$(dirname "$0")/../.." && pwd); BIN="${BIN:-$D/target/release/macpro-fand}"; U=macpro-fand-test
-S=/sys/devices/LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:1f/APP0001:00
+S=$(for d in /sys/bus/acpi/devices/APP0001:* /sys/bus/platform/devices/APP0001:*; do [ -e "$d/fan1_manual" ] && { echo "$d"; break; }; done)   # the device applesmc bound (ACPI <= 7.2, platform >= 7.3)
+: "${S:?no applesmc fan attributes (applesmc-t2 loaded?)}"
 OV=/run/macpro-fand/override
 pass=0; fail=0
 ok()  { echo "PASS  $*"; pass=$((pass + 1)); }

@@ -199,7 +199,13 @@ pub fn find_smc(paths: &Paths) -> Option<PathBuf> {
         candidates.push(h.clone());
         candidates.push(h.join("device"));
     }
+    // applesmc-t2 binds the ACPI device up to kernel 7.2 and, from 7.3 (struct acpi_driver is gone), the platform
+    // device the ACPI core creates for the same APP0001 node; the fan attributes follow the bound device.
     candidates.extend(named_children(paths.sys("bus/acpi/devices"), "APP0001:"));
+    candidates.extend(named_children(
+        paths.sys("bus/platform/devices"),
+        "APP0001:",
+    ));
     candidates.push(paths.sys("devices/platform/applesmc.768"));
     candidates
         .into_iter()
@@ -560,6 +566,33 @@ pub(crate) mod tests {
         let p = p.as_ref();
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, text).unwrap();
+    }
+    #[test]
+    fn find_smc_follows_the_bound_device_on_both_kernel_lines() {
+        let root = crate::os::tests::temp();
+        let paths = Paths {
+            sys: root.join("sys"),
+            run: root.join("run"),
+        };
+        let acpi = paths.sys("bus/acpi/devices/APP0001:00");
+        let platform = paths.sys("bus/platform/devices/APP0001:00");
+        // Both nodes always exist; only the one the driver bound carries fan attributes.
+        put(acpi.join("modalias"), "acpi:APP0001:SMC-HURONRIVER:");
+        put(platform.join("modalias"), "acpi:APP0001:SMC-HURONRIVER:");
+        assert_eq!(find_smc(&paths), None, "no driver bound: no SMC");
+        put(platform.join("fan1_manual"), "0");
+        assert_eq!(
+            find_smc(&paths),
+            Some(platform.clone()),
+            "7.3+: platform device"
+        );
+        put(acpi.join("fan1_manual"), "0");
+        assert_eq!(
+            find_smc(&paths),
+            Some(acpi),
+            "up to 7.2: ACPI device, first"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn sampler_sleep_has_no_polling_wakeups_and_stops_at_once() {

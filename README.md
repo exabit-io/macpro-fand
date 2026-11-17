@@ -83,8 +83,8 @@ sudo tests/hardware/failover-tests.sh   # on an installed package: the t2fanrd o
 
 The existing `/etc/macpro-fand.conf`, `/run/macpro-fand/override`, command-line options and systemd unit paths are
 preserved. The package installs `/usr/sbin/macpro-fand` and requires `systemd`, libc and libgcc, with no Python
-runtime dependency. Installation starts the service. Hardware prerequisites remain `applesmc-t2`, `amdgpu`, `coretemp`
-and `intel-rapl`.
+runtime dependency. Installation starts the service. Hardware prerequisites remain `applesmc-t2` (0.1.5 or later on kernel 7.3 and later), `amdgpu`,
+`coretemp` and `intel-rapl`.
 
 ## Install
 

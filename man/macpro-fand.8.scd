@@ -365,8 +365,8 @@ DC power and the dies' working-temperature ceilings).
 
 # REQUIREMENTS
 
-A Mac Pro 7,1 with the applesmc-t2 driver (fan control through the T2 chip),
-the amdgpu driver for the GPU dies, coretemp and the intel-rapl powercap
+A Mac Pro 7,1 with the applesmc-t2 driver (fan control through the T2 chip;
+version 0.1.5 or later on kernel 7.3 and later), the amdgpu driver for the GPU dies, coretemp and the intel-rapl powercap
 interface. Must run as root.
 
 Supported GPUs are Vega 20 dies (Radeon Pro Vega II and Vega II Duo MPX

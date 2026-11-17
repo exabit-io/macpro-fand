@@ -301,3 +301,14 @@ and the ConnectX-5 Ex has one (mlx5 hwmon). The three tests now select a sensorl
 line (`sensorless()` in the runner; here the PEX 8718 switches of the P4618 cards, with a stub `TEMP_COMMAND` program in
 T30) and pass: `tests/hardware/results-20261115-0949-203pkg.txt` (35 + the three failures),
 `results-20261115-0949-203pkg-t30-t31.txt` (the three, adapted), `failover-20261115-0949-203pkg.txt` (9 of 9).
+
+## 2.0.4: kernel 7.3 and later
+
+Kernel 7.3 removed `struct acpi_driver`; applesmc-t2 0.1.5 (t2-ubuntu-repo) binds the platform device the ACPI core
+creates for `APP0001` instead, and its fan attributes move from `/sys/bus/acpi/devices/APP0001:00/` to
+`/sys/bus/platform/devices/APP0001:00/` (`/sys/devices/pci0000:00/0000:00:1f.0/APP0001:00`). `find_smc()`
+(`src/hardware.rs`) now takes candidates from both buses, ACPI first; on 7.2 and earlier the platform node exists but has
+no fan attributes, so the choice is unchanged there. The `fans-to-max` failsafe and the two hardware runners use the same
+two places. t2fanrd 0.1.0-5 needs no change: its glob `/sys/devices/pci*/*/*/*/APP0001:00/fan*` reaches the platform
+device through the LPC bridge's `firmware_node/physical_node` links (code reading; confirm on the first 7.3 boot).
+Unit test: `find_smc_follows_the_bound_device_on_both_kernel_lines`.

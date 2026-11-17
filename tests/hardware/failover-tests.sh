@@ -6,7 +6,9 @@
 # run-tests.sh, which moves the fans and burns the GPUs). Restores the override, /etc/t2fand.conf, the unit state and
 # t2fanrd's enablement on exit.
 set -u
-S=/sys/bus/acpi/devices/APP0001:00; OV=/run/macpro-fand/override; T2C=/etc/t2fand.conf
+S=$(for d in /sys/bus/acpi/devices/APP0001:* /sys/bus/platform/devices/APP0001:*; do [ -e "$d/fan1_manual" ] && { echo "$d"; break; }; done)   # the device applesmc bound (ACPI <= 7.2, platform >= 7.3)
+: "${S:?no applesmc fan attributes (applesmc-t2 loaded?)}"
+OV=/run/macpro-fand/override; T2C=/etc/t2fand.conf
 DROP=/run/systemd/system/macpro-fand.service.d/zz-failover-test.conf
 pass=0; fail=0
 ok()  { echo "PASS  $*"; pass=$((pass + 1)); }

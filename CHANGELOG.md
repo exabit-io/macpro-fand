@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.0.4
+
+Kernel 7.3 and later.
+
+- **SMC discovery.** From kernel 7.3 `struct acpi_driver` is gone, and applesmc-t2 0.1.5 binds the platform device
+  the ACPI core creates for the `APP0001` node instead of the ACPI device; the fan attributes move with it, from
+  `/sys/bus/acpi/devices/APP0001:00/` to `/sys/bus/platform/devices/APP0001:00/`. 2.0.3 looked only at the ACPI
+  device (and at `applesmc.768`), so on 7.3 it would have exited with `applesmc fan attributes not found`. It now
+  looks at both, ACPI first, so nothing changes on 7.2 and earlier, where the platform node exists without fan
+  attributes.
+- **Failsafe.** `fans-to-max` had the same ACPI-only glob, so on 7.3 it would have found no fans and left them to the
+  SMC's automatic mode. It now takes the fans from whichever device carries them.
+- Unit test for discovery on both kernel lines; the hardware runners resolve the SMC path the same way instead of a
+  fixed ACPI path.
+- Requirement: applesmc-t2 0.1.5 or later on kernel 7.3 and later (0.1.4 does not build there).
+
 ## 2.0.3
 
 One fix: the stop hook no longer fails at every shutdown and reboot.
