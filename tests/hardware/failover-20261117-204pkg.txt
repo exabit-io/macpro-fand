@@ -1,0 +1,11 @@
+PASS  F1 installed: macpro-fand owner, t2fanrd off at boot, drop-in loaded, no Conflicts
+PASS  F2 t2fanrd start beside macpro-fand refused; macpro-fand untouched (pid 2689212)
+PASS  F3 restart window (activating auto-restart ): t2fanrd refused, macpro-fand back
+PASS  F4 clean stop -> t2fanrd
+PASS  F5 start stops t2fanrd first; macpro-fand in charge
+PASS  F6 permanent failure -> backup: full speed, t2fanrd started
+PASS  F6b next start takes the fans back from t2fanrd
+PASS  F7 t2fanrd stop with no owner -> full speed (curve was 500 500 500 500 )
+PASS  F8 no t2fanrd: permanent failure -> full speed, nothing else
+restored: macpro-fand active, t2fanrd inactive/disabled, override '', fans 600 1150 1150 500 
+end: 9 passed, 0 failed
